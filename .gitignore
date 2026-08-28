@@ -1,0 +1,10 @@
+# ข้อมูลบัญชี - ห้าม push ขึ้น GitHub
+backup/
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
