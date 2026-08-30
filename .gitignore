@@ -8,3 +8,6 @@ logs/
 # Python
 __pycache__/
 *.pyc
+update_temp/
+*_update.zip
+test-ocr-output/
