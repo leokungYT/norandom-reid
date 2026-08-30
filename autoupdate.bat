@@ -11,11 +11,14 @@ setlocal enabledelayedexpansion
 :: overwrite autoupdate.bat itself in the bot folder.
 if /i not "%~dp0"=="%TEMP%\" (
     copy /y "%~f0" "%TEMP%\norandom_autoupdate.bat" >nul
-    start "norandom-reid Auto Update" "%TEMP%\norandom_autoupdate.bat" "%~dp0"
+    set "NR_TARGET=%~dp0"
+    start "norandom-reid Auto Update" "%TEMP%\norandom_autoupdate.bat"
     exit
 )
 
-set "TARGET_FOLDER=%~1"
+:: target folder comes from the parent via env var (no quoted args = no cmd quote-stripping bug)
+set "TARGET_FOLDER=%NR_TARGET%"
+if not defined TARGET_FOLDER set "TARGET_FOLDER=%~1"
 if "%TARGET_FOLDER:~-1%"=="\" set "TARGET_FOLDER=%TARGET_FOLDER:~0,-1%"
 cd /d "%TARGET_FOLDER%"
 

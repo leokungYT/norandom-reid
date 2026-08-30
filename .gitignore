@@ -11,3 +11,4 @@ __pycache__/
 update_temp/
 *_update.zip
 test-ocr-output/
+debug/

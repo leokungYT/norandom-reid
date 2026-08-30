@@ -21,6 +21,47 @@ import pyperclip
 clipboard_lock = threading.Lock()
 used_uids = set()
 
+# ทำงานจากโฟลเดอร์ของไฟล์นี้เสมอ - ไม่ว่าจะรันจาก shortcut/โฟลเดอร์ไหน path 'img/...' ก็ต้องเจอ
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+# รูปสำคัญที่บอทต้องใช้ - เช็คตอนเริ่มว่าโหลดได้จริง (ถ้าโหลดไม่ได้ ImgSearchADB จะเงียบและไม่กดอะไรเลย)
+REQUIRED_IMAGES = [
+    'img/guestloing.png', 'img/login.png', 'img/checkpoint-click.bmp', 'img/ok.png',
+    'img/mainstage.png', 'img/event.png', 'img/cancel.png', 'img/7day.png',
+    'img/box3.png', 'img/coyp-id1.bmp', 'img/coyp-id2.bmp', 'img/coyp-id3.bmp', 'img/saveteam.png',
+]
+
+
+def check_required_images():
+    """เช็คว่ารูป template สำคัญมีอยู่และเปิดได้ - พิมพ์เตือนชัดๆ ถ้ามีปัญหา"""
+    print(f"\n=== เช็ครูป template (โฟลเดอร์ทำงาน: {os.getcwd()}) ===")
+    missing = []
+    for path in REQUIRED_IMAGES:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            missing.append(path)
+            print(f"  [X] โหลดไม่ได้: {path}")
+        else:
+            print(f"  [OK] {path} ({img.shape[1]}x{img.shape[0]})")
+    if missing:
+        print(f"!!! รูปหาย/เปิดไม่ได้ {len(missing)} ไฟล์ - บอทจะไม่กดอะไรเลยถ้ารูปพวกนี้ไม่มี !!!")
+    else:
+        print("รูป template ครบทุกไฟล์")
+    return not missing
+
+
+def debug_match_score(adb_img, find_img_path):
+    """คืนค่า match สูงสุด (0-1) ของรูป template บนหน้าจอ - ใช้วินิจฉัยว่าทำไมหาไม่เจอ"""
+    try:
+        tpl = cv2.imread(find_img_path, cv2.IMREAD_COLOR)
+        if tpl is None:
+            return None
+        if tpl.shape[0] > adb_img.shape[0] or tpl.shape[1] > adb_img.shape[1]:
+            return -1.0  # template ใหญ่กว่าหน้าจอ = ความละเอียดไม่ตรงแน่นอน
+        return float(cv2.matchTemplate(adb_img, tpl, cv2.TM_CCOEFF_NORMED).max())
+    except Exception:
+        return None
+
 # ตั้งค่า Tesseract OCR สำหรับอ่าน UID จากหน้าจอ (แต่ละเครื่องอ่านจอตัวเอง แยกขาดกัน ไม่ใช้ clipboard)
 pytesseract.pytesseract.tesseract_cmd = r"C:\Users\Administrator\Downloads\CookieRun\src\Tesseract-OCR\tesseract.exe"
 
@@ -636,7 +677,8 @@ def perform_sing_actions(device):
                 image = np.frombuffer(cap, dtype=np.uint8)
                 adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
 
-                pos_guest = ImgSearchADB(adb_img, 'img/guestloing.png')
+                # ใช้ threshold 0.9 (ปุ่ม Guest Login เด่นมาก) เผื่อเครื่องอื่นเรนเดอร์ต่างกันเล็กน้อย
+                pos_guest = ImgSearchADB(adb_img, 'img/guestloing.png', threshold=0.9)
                 if pos_guest:
                     print(f"\nDevice {device.serial}: === พบ Guest Login กดเลย ===")
                     device.shell(f"input tap {pos_guest[0][0]} {pos_guest[0][1]}")
@@ -650,7 +692,7 @@ def perform_sing_actions(device):
 
                 # ค้นหา login.png จากภาพล่าสุด
                 print(f"Device {device.serial}: กำลังค้นหา login.png...")
-                pos_login = ImgSearchADB(adb_img, 'img/login.png')
+                pos_login = ImgSearchADB(adb_img, 'img/login.png', threshold=0.9)
                 if pos_login:
                     print(f"\nDevice {device.serial}: === เริ่มขั้นตอน Login ===")
                     device.shell(f"input tap {pos_login[0][0]} {pos_login[0][1]}")
@@ -694,6 +736,23 @@ def perform_sing_actions(device):
                     return True
 
                 retry_count += 1
+
+                # วินิจฉัยทุก 5 ครั้งที่หาไม่เจอ: บอกความละเอียดจอ + คะแนน match + เซฟภาพไว้ดู
+                if retry_count % 5 == 0:
+                    h, w = adb_img.shape[:2]
+                    sg = debug_match_score(adb_img, 'img/guestloing.png')
+                    sl = debug_match_score(adb_img, 'img/login.png')
+                    fmt = lambda s: "โหลดรูปไม่ได้" if s is None else ("รูปใหญ่กว่าจอ" if s < 0 else f"{s:.2f}")
+                    print(f"Device {device.serial}: [วินิจฉัย] จอ {w}x{h} (ต้องเป็น 960x540) | "
+                          f"match guestlogin={fmt(sg)} login={fmt(sl)} (ต้อง >= 0.90)")
+                    try:
+                        os.makedirs("debug", exist_ok=True)
+                        dbg_path = os.path.join("debug", f"{device.serial.replace(':', '_')}_guestlogin_miss.png")
+                        cv2.imwrite(dbg_path, adb_img)
+                        print(f"Device {device.serial}: [วินิจฉัย] เซฟภาพหน้าจอไว้ที่ {dbg_path}")
+                    except Exception:
+                        pass
+
                 time.sleep(2)  # เพิ่มการรอระหว่างการลองใหม่
 
             except Exception as e:
@@ -1468,6 +1527,7 @@ def Main():
     while True:
         try:
             print("\n=== เริ่มต้นโปรแกรม ===")
+            check_required_images()
             print("กำลังค้นหาอุปกรณ์ MuMu...")
             adb, devices = connect_to_mumu()
             
