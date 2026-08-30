@@ -7,19 +7,31 @@ setlocal enabledelayedexpansion
 :: URL: https://github.com/leokungYT/norandom-reid
 :: =========================================================
 
-:: Re-launch a copy of this .bat from TEMP so the update can safely
-:: overwrite autoupdate.bat itself in the bot folder.
-if /i not "%~dp0"=="%TEMP%\" (
+:: --- Two-stage run so the update can overwrite this .bat safely ---
+:: Parent (no GO flag): remember target folder in a marker file, copy self
+:: to TEMP, relaunch the copy with a simple GO flag (no path arg = no cmd
+:: quote/backslash bug), then exit. Child (GO flag) reads the marker.
+if not "%~1"=="GO" (
+    > "%TEMP%\norandom_target.txt" echo %~dp0
     copy /y "%~f0" "%TEMP%\norandom_autoupdate.bat" >nul
-    set "NR_TARGET=%~dp0"
-    start "norandom-reid Auto Update" "%TEMP%\norandom_autoupdate.bat"
+    start "norandom-reid Auto Update" "%TEMP%\norandom_autoupdate.bat" GO
     exit
 )
 
-:: target folder comes from the parent via env var (no quoted args = no cmd quote-stripping bug)
-set "TARGET_FOLDER=%NR_TARGET%"
-if not defined TARGET_FOLDER set "TARGET_FOLDER=%~1"
+:: --- Child: read target folder from the marker file ---
+set "TARGET_FOLDER="
+set /p TARGET_FOLDER=<"%TEMP%\norandom_target.txt"
+if not defined TARGET_FOLDER (
+    echo [ERROR] Could not read target folder marker. Run this .bat again from the bot folder.
+    pause
+    exit /b 1
+)
 if "%TARGET_FOLDER:~-1%"=="\" set "TARGET_FOLDER=%TARGET_FOLDER:~0,-1%"
+if not exist "%TARGET_FOLDER%" (
+    echo [ERROR] Target folder not found: %TARGET_FOLDER%
+    pause
+    exit /b 1
+)
 cd /d "%TARGET_FOLDER%"
 
 echo.
