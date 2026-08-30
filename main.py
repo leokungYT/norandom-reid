@@ -1084,6 +1084,7 @@ def reset_app_and_login(device, clear_app_wait=5):
 
 def device_worker(device):
     """Worker function for handling device automation"""
+    mark_activity(device)  # arm watchdog 25 นาที ตั้งแต่วินาทีแรกที่บอทเริ่มทำงาน
     last_memory_cleanup = time.time()
     last_image_cleanup = time.time()
     MEMORY_CLEANUP_INTERVAL = 300  # ทำความสะอาด memory ทุก 5 นาที
