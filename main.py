@@ -14,6 +14,121 @@ import psutil
 import socket
 import concurrent.futures
 import gc  # Add this with your other imports
+import pytesseract
+import pyperclip
+
+# สำหรับแผนสำรองอ่าน UID ผ่าน clipboard (ตอน OCR เฟล) - ต่อคิวทีละเครื่องกันค่าซ้อนกัน
+clipboard_lock = threading.Lock()
+used_uids = set()
+
+# ตั้งค่า Tesseract OCR สำหรับอ่าน UID จากหน้าจอ (แต่ละเครื่องอ่านจอตัวเอง แยกขาดกัน ไม่ใช้ clipboard)
+pytesseract.pytesseract.tesseract_cmd = r"C:\Users\Administrator\Downloads\CookieRun\src\Tesseract-OCR\tesseract.exe"
+
+# ตำแหน่งข้อความ UID บนหน้าจอหลังกด coyp-id2 (x, y, กว้าง, สูง)
+UID_REGION = (392, 238, 209, 43)
+
+
+# ตารางแปลงตัวอักษรที่ OCR ชอบอ่านสับสน กลับเป็นเลขฐาน 16 (UID เป็น hex ตัวพิมพ์เล็ก)
+OCR_NORMALIZE = str.maketrans({'O': '0', 'o': '0', 'Q': '0', 'D': '0',
+                               'I': '1', 'l': '1', 'L': '1', '|': '1', '!': '1',
+                               'Z': '2', 'z': '2', 'S': '5', 's': '5'})
+OCR_WHITELIST = '0123456789abcdefABCDEFoOQDIlL|!zZsS'
+
+
+def read_uid_ocr(device):
+    """อ่าน UID จากหน้าจอของเครื่องนั้นๆ ด้วย OCR ตามตำแหน่ง UID_REGION
+    วิธี: แยกตัวอักษรสีเหลืองออกจากพื้นหลัง ตัดทีละตัว แล้ว OCR ทีละตัวอักษร
+    (ทดสอบแล้วแม่นกว่าอ่านทั้งบรรทัด ซึ่งชอบตกเลข 1 ท้ายและอ่านเลข 0 เป็นตัว O)"""
+    try:
+        cap = device.screencap()
+        image = np.frombuffer(cap, dtype=np.uint8)
+        screen = cv2.imdecode(image, cv2.IMREAD_COLOR)
+        x, y, w, h = UID_REGION
+        crop = cv2.resize(screen[y:y + h, x:x + w], None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+
+        # แยกตัวอักษรสีเหลืองออกจากพื้นน้ำตาล
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (15, 80, 120), (45, 255, 255))
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = sorted([cv2.boundingRect(c) for c in cnts if cv2.boundingRect(c)[3] > 20],
+                       key=lambda b: b[0])
+        if not boxes:
+            print(f"Device {device.serial}: OCR ไม่พบตัวอักษรใน region")
+            return None
+
+        uid = ''
+        for (bx, by, bw, bh) in boxes:
+            ch = cv2.copyMakeBorder(255 - mask[by:by + bh, bx:bx + bw],
+                                    25, 25, 25, 25, cv2.BORDER_CONSTANT, value=255)
+            t = ''
+            for psm in (10, 8):
+                t = pytesseract.image_to_string(
+                    ch, config=f'--psm {psm} -c tessedit_char_whitelist={OCR_WHITELIST}').strip()
+                t = re.sub(r'[^0-9a-f]', '', t.translate(OCR_NORMALIZE).lower())
+                if t:
+                    break
+            if not t:
+                # อ่านตัวใดตัวหนึ่งไม่ได้ = อย่าเดา คืน None ให้ไปใช้ชื่อไฟล์สำรองแทน
+                print(f"Device {device.serial}: OCR อ่านตัวอักษรบางตัวไม่ได้ (ได้แค่ '{uid}')")
+                return None
+            uid += t[0]
+
+        print(f"Device {device.serial}: ได้ UID จาก OCR: {uid}")
+        return uid
+    except Exception as e:
+        print(f"Device {device.serial}: ข้อผิดพลาด OCR: {e}")
+        return None
+
+
+def copy_uid_via_id3(device, max_find_attempts=15):
+    """แผนสำรองเมื่อ OCR อ่านไม่ได้: หาและกดปุ่ม coyp-id3 แล้วอ่าน UID จาก clipboard ของ Windows
+    (MuMu sync clipboard มาที่ PC - ใช้ lock ต่อคิวทีละเครื่อง + เช็คค่าซ้ำ กันค่าซ้อนกัน)"""
+    copy_pos = None
+    for _ in range(max_find_attempts):
+        try:
+            cap = device.screencap()
+            image = np.frombuffer(cap, dtype=np.uint8)
+            screen = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            copy_pos = ImgSearchADB(screen, 'img/coyp-id3.bmp')
+            if copy_pos:
+                break
+        except Exception as e:
+            print(f"Device {device.serial}: ข้อผิดพลาดในการหา coyp-id3: {e}")
+        time.sleep(1)
+
+    if not copy_pos:
+        print(f"Device {device.serial}: ไม่พบปุ่ม coyp-id3 บนหน้าจอ")
+        return None
+
+    with clipboard_lock:
+        for attempt in range(1, 4):
+            try:
+                pyperclip.copy("")
+            except Exception:
+                pass
+            device.shell(f"input tap {copy_pos[0][0]} {copy_pos[0][1]}")
+            time.sleep(2)  # รอ MuMu sync clipboard มาที่ PC
+            try:
+                value = (pyperclip.paste() or "").strip()
+            except Exception:
+                value = None
+
+            if not value:
+                print(f"Device {device.serial}: clipboard ว่าง (ครั้งที่ {attempt}/3) ลองกด copy ใหม่...")
+                continue
+            if re.search(r'\s', value) or len(value) > 64:
+                print(f"Device {device.serial}: ค่าใน clipboard ผิดรูปแบบ ({value[:40]!r}) ลองกด copy ใหม่...")
+                continue
+            if value in used_uids:
+                print(f"Device {device.serial}: UID {value} ซ้ำกับที่ใช้ไปแล้ว (ค่าค้าง) ลองกด copy ใหม่...")
+                continue
+
+            used_uids.add(value)
+            print(f"Device {device.serial}: ได้ UID จาก clipboard (coyp-id3): {value}")
+            return value
+
+    print(f"Device {device.serial}: อ่าน UID จาก clipboard ไม่สำเร็จ")
+    return None
 
 def find_mumu_adb_ports():
     """ค้นหา port ของ MuMu ADB ที่ active อยู่"""
@@ -280,8 +395,9 @@ def connect_to_mumu():
         print(f"Error in connect_to_mumu: {e}")
         return None, []
 
-def backup_game_data(device):
-    """Backup game data with sequential ID naming and detailed logging"""
+def backup_game_data(device, uid=None):
+    """Backup game data with sequential ID naming and detailed logging
+    ถ้าส่ง uid มา จะตั้งชื่อไฟล์เป็น noradom+[uid]+_LINE_COCOS_PREF_KEY.xml"""
     try:
         # กำหนดค่าคงที่สำหรับการรอ
         INITIAL_WAIT = 5        # เวลารอก่อนทำ backup
@@ -301,7 +417,12 @@ def backup_game_data(device):
             
         # สร้างชื่อไฟล์ backup
         next_id = get_next_backup_id()
-        backup_path = f"backup/botick-id{next_id}_LINE_COCOS_PREF_KEY_{current_time}.xml"
+        if uid:
+            # ตั้งชื่อตาม UID ที่ copy มาจากเกม เช่น noradom+[409f99e9]+_LINE_COCOS_PREF_KEY.xml
+            safe_uid = re.sub(r'[\\/:*?"<>|\s]', '', uid)
+            backup_path = f"backup/noradom+[{safe_uid}]+_LINE_COCOS_PREF_KEY.xml"
+        else:
+            backup_path = f"backup/botick-id{next_id}_LINE_COCOS_PREF_KEY_{current_time}.xml"
         device_id = device.serial
         
         print(f"\nDevice {device.serial}: === ข้อมูล Backup ===")
@@ -535,6 +656,22 @@ def perform_sing_actions(device):
                     device.shell(f"input tap {pos_login[0][0]} {pos_login[0][1]}")
                     time.sleep(3)
 
+                    # รอเรื่อยๆ จนเจอ checkpoint-click แล้วค่อยคลิก
+                    checkpoint_attempt = 0
+                    while True:
+                        checkpoint_attempt += 1
+                        print(f"Device {device.serial}: กำลังรอ checkpoint-click (ครั้งที่ {checkpoint_attempt})")
+                        cap = device.screencap()
+                        image = np.frombuffer(cap, dtype=np.uint8)
+                        adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                        pos_checkpoint = ImgSearchADB(adb_img, 'img/checkpoint-click.bmp')
+                        if pos_checkpoint:
+                            print(f"\nDevice {device.serial}: === พบ checkpoint-click กดเลย ===")
+                            device.shell(f"input tap {pos_checkpoint[0][0]} {pos_checkpoint[0][1]}")
+                            time.sleep(2)
+                            break
+                        time.sleep(2)
+
                     # ทำการ login ตามขั้นตอน
                     login_steps = [
                         ("input tap 928 137", 2),
@@ -576,23 +713,89 @@ def perform_sing_actions(device):
 
 
 
+def open_app(device, max_attempts=5):
+    """เปิดแอป LINE Rangers ด้วย am start / monkey สลับกัน แล้วเช็ค pidof ว่าเปิดติดจริง (แบบเดียวกับ login.py ของ LGR)"""
+    # เช็คครั้งเดียวว่าเกมติดตั้งอยู่ไหม - ถ้าไม่ติดตั้งจะ retry กี่ครั้งก็เปิดไม่ได้
+    try:
+        pm_out = device.shell("pm list packages com.linecorp.LGRGS") or ""
+        if "com.linecorp.LGRGS" not in pm_out:
+            print(f"Device {device.serial}: ⛔ ไม่พบแอป com.linecorp.LGRGS บนเครื่องนี้! (ยังไม่ได้ติดตั้ง/ชื่อ package ไม่ตรง)")
+            return False
+    except Exception as e:
+        print(f"Device {device.serial}: [WARN] เช็ค package ไม่ได้: {e} - ลองเปิดต่อ")
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # สลับวิธีเปิด: am start กับ monkey
+            if attempt % 2 == 1:
+                launch_out = device.shell("am start -S -n com.linecorp.LGRGS/.LineRangersAdr")
+            else:
+                launch_out = device.shell("monkey -p com.linecorp.LGRGS -c android.intent.category.LAUNCHER 1")
+            time.sleep(3)
+
+            # ตรวจว่าแอปยังรันอยู่ด้วย pidof
+            pid = (device.shell("pidof com.linecorp.LGRGS") or "").strip()
+            if pid:
+                print(f"Device {device.serial}: ✓ เปิดแอพติดแล้ว (PID: {pid}) - ครั้งที่ {attempt}")
+                return True
+
+            launch_msg = (launch_out or "").strip().replace("\n", " | ")
+            print(f"Device {device.serial}: ✗ แอพเปิดไม่ติด (ครั้งที่ {attempt}) ลองใหม่... | สาเหตุจาก launch: {launch_msg[:250] or '(ไม่มี output)'}")
+            time.sleep(2)
+
+        except Exception as e:
+            print(f"Device {device.serial}: ข้อผิดพลาดในการเปิดแอพ (ครั้งที่ {attempt}): {e}")
+            time.sleep(2)
+
+    print(f"Device {device.serial}: เปิดแอพไม่สำเร็จหลังลอง {max_attempts} ครั้ง!")
+    return False
+
+
+def reset_app_and_login(device, clear_app_wait=5):
+    """ปิดแอพ -> ลบข้อมูลภายในแอพ (เก็บทรัพยากรเกม 1.5GB ใน /sdcard ไว้) -> เปิดแอพใหม่ -> หา guestlogin
+    ถ้าหา guestlogin ไม่เจอเกินกำหนด (30 ครั้ง) จะปิดแอพแล้วเริ่มใหม่ตั้งแต่ลบไฟล์ วนจนกว่าจะสำเร็จ"""
+    cycle = 0
+    while True:
+        cycle += 1
+        print(f"\nDevice {device.serial}: === เริ่มกระบวนการลบข้อมูลภายในแอพ (รอบที่ {cycle}) ===")
+        try:
+            print(f"Device {device.serial}: [1/3] กำลังปิดแอพ...")
+            device.shell("am force-stop com.linecorp.LGRGS")
+            time.sleep(2)
+
+            print(f"Device {device.serial}: [2/3] กำลังลบข้อมูลภายในแอพ (ไม่แตะทรัพยากรเกม 1.5GB)...")
+            device.shell("su -c 'rm -rf /data/data/com.linecorp.LGRGS/shared_prefs /data/data/com.linecorp.LGRGS/files /data/data/com.linecorp.LGRGS/databases /data/data/com.linecorp.LGRGS/no_backup /data/data/com.linecorp.LGRGS/app_webview /data/data/com.linecorp.LGRGS/app_pccache /data/data/com.linecorp.LGRGS/app_tmppccache /data/data/com.linecorp.LGRGS/app_textures /data/data/com.linecorp.LGRGS/cache /data/data/com.linecorp.LGRGS/code_cache'")  # ลบข้อมูลภายในทั้งหมด แต่เก็บทรัพยากรเกม 1.5GB ใน /sdcard ไว้
+            print(f"Device {device.serial}: ลบข้อมูลภายในแอพเสร็จสิ้น (logout แล้ว)")
+
+            print(f"Device {device.serial}: รอ {clear_app_wait} วินาทีก่อนเริ่มต่อ...")
+            for i in range(clear_app_wait, 0, -1):
+                print(f"Device {device.serial}: เหลือเวลา {i} วินาที")
+                time.sleep(1)
+
+            print(f"Device {device.serial}: [3/3] กำลังเปิดแอพใหม่ (แบบ login.py)...")
+            open_app(device)
+            time.sleep(5)
+
+            # ค้นหา guestlogin.png ทันทีตั้งแต่เปิดแอพ
+            if perform_sing_actions(device):
+                return True
+
+            print(f"Device {device.serial}: หา guestlogin ไม่เจอเกินกำหนด - ปิดแอพแล้วเริ่มใหม่ตั้งแต่ลบไฟล์...")
+        except Exception as e:
+            print(f"Device {device.serial}: ข้อผิดพลาดในกระบวนการรีเซ็ตแอพ: {e}")
+            time.sleep(3)
+
+
 def device_worker(device):
     """Worker function for handling device automation"""
     last_memory_cleanup = time.time()
     last_image_cleanup = time.time()
     MEMORY_CLEANUP_INTERVAL = 300  # ทำความสะอาด memory ทุก 5 นาที
-    IMAGE_CLEANUP_INTERVAL = 60    # ทำความสะอาด image cache ทุก 1 นาที
+    IMAGE_CLEANUP_INTERVAL = 300   # ทำความสะอาด image cache ทุก 5 นาที (รูป template ไม่เคยเปลี่ยน ไม่ต้องล้างบ่อย)
     while True:  # เพิ่ม loop หลักเพื่อทำงานต่อเนื่อง
         try:
-            
-                        # เริ่ม thread สำหรับตรวจสอบสีหน้าจอ
-            monitor_thread = threading.Thread(
-                target=monitor_screen_color,
-                args=(device,),
-                daemon=True  # ให้ thread จบเมื่อโปรแกรมหลักจบ
-            )
-            monitor_thread.start()
-            
+            # (ตัด thread ตรวจสีหน้าจอแยกออก - loop หลักเช็คจอเทาอยู่แล้ว
+            #  thread เดิมถ่ายภาพหน้าจอซ้ำซ้อนทุกวินาทีและเพิ่มขึ้นเรื่อยๆ ทุกรอบ ทำให้บอทหน่วง)
             limit_cpu_usage()
             
             # ค่าคงที่สำหรับการตั้งค่าเวลา
@@ -609,31 +812,12 @@ def device_worker(device):
             print(f"Time: 2025-05-02 13:03:26")
             print(f"User: leokungYT")
 
-            # ขั้นตอนแรก: ลบเฉพาะไฟล์ shared_prefs .xml และรีสตาร์ท
-            print(f"\nDevice {device.serial}: === เริ่มกระบวนการลบไฟล์ shared_prefs ===")
+            # ขั้นตอนแรก: ลบข้อมูลภายในแอพ + เปิดแอพ + หา guestlogin
+            # (ถ้าหา guestlogin เกิน 30 ครั้งไม่เจอ จะปิดแอพแล้วเริ่มใหม่ตั้งแต่ลบไฟล์เอง)
             try:
-                print(f"Device {device.serial}: [1/3] กำลังปิดแอพ...")
-                device.shell("am force-stop com.linecorp.LGRGS")
-                time.sleep(2)
-
-                print(f"Device {device.serial}: [2/3] กำลังลบไฟล์ _LINE_COCOS_PREF_KEY.xml...")
-                device.shell("su -c 'rm /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
-                print(f"Device {device.serial}: ลบไฟล์ shared_prefs เสร็จสิ้น")
-
-                print(f"Device {device.serial}: รอ {CLEAR_APP_WAIT} วินาทีก่อนเริ่มต่อ...")
-                for i in range(CLEAR_APP_WAIT, 0, -1):
-                    print(f"Device {device.serial}: เหลือเวลา {i} วินาที")
-                    time.sleep(1)
-
-                print(f"Device {device.serial}: [3/3] กำลังเปิดแอพใหม่...")
-                device.shell("monkey -p com.linecorp.LGRGS 1")
-                time.sleep(5)
-
-                # ค้นหา guestlogin.png ทันทีตั้งแต่เปิดแอพ
-                perform_sing_actions(device)
-
+                reset_app_and_login(device, CLEAR_APP_WAIT)
             except Exception as e:
-                print(f"Device {device.serial}: เกิดข้อผิดพลาดในการลบไฟล์ shared_prefs: {e}")
+                print(f"Device {device.serial}: เกิดข้อผิดพลาดในการลบข้อมูลภายในแอพ: {e}")
                 print("ดำเนินการต่อ...")
 
             # ตัวแปรสำหรับการติดตามสถานะ
@@ -688,10 +872,8 @@ def device_worker(device):
 
             while True:
                 try:
-                    # ถ่ายภาพหน้าจอสำหรับตรวจจับรูปภาพ
+                    # ถ่ายภาพหน้าจอสำหรับตรวจจับรูปภาพ (ประมวลผลทันที ไม่รอให้ภาพเก่า)
                     cap = device.screencap()
-                    # เพิ่ม sleep time หลังการ screencap
-                    time.sleep(SEARCH_INTERVAL)
                     image = np.frombuffer(cap, dtype=np.uint8)
                     adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
                     found_any_image = False
@@ -700,7 +882,6 @@ def device_worker(device):
 
                     # ในส่วนของการตรวจสอบสีหน้าจอ:
                     screen_percentage, is_gray_screen = check_screen_color(adb_img)
-                    print(f"Device {device.serial}: สีเทา (0x303030): {screen_percentage:.2f}%")
 
                     current_time = time.time()
                     
@@ -716,19 +897,6 @@ def device_worker(device):
 
                     if is_gray_screen:  # ถ้าเกิน 80%
                         if gray_screen_start_time is None:
-                            # เริ่มจับเวลาเมื่อเจอหน้าจอสีเทาครั้งแรก
-                            gray_screen_start_time = time.time()
-                            print(f"Device {device.serial}: เริ่มจับเวลาหน้าจอสีเทา...")
-                        else:
-                            # คำนวณเวลาที่ผ่านไป
-                            elapsed_time = time.time() - gray_screen_start_time
-                            remaining_time = GRAY_SCREEN_TIMEOUT - elapsed_time
-                            
-                            # แสดงเวลาที่เหลือ
-                            print(f"Device {device.serial}: หน้าจอสีเทาค้าง {elapsed_time:.1f} วินาที (เหลือ {remaining_time:.1f} วินาที)")
-                            
-                    if is_gray_screen:  # ถ้าเกิน 80%
-                        if gray_screen_start_time is None:
                             gray_screen_start_time = time.time()
                             print(f"Device {device.serial}: เริ่มจับเวลาหน้าจอสีเทา...")
                         else:
@@ -742,7 +910,7 @@ def device_worker(device):
                                 
                                 device.shell("am force-stop com.linecorp.LGRGS")
                                 time.sleep(2)
-                                device.shell("monkey -p com.linecorp.LGRGS 1")
+                                open_app(device)
                                 time.sleep(5)
                                 
                                 gray_screen_start_time = None
@@ -769,7 +937,7 @@ def device_worker(device):
                             time.sleep(1)
                         
                         print(f"Device {device.serial}: [3/3] เปิดแอพใหม่...")
-                        device.shell("monkey -p com.linecorp.LGRGS 1")
+                        open_app(device)
                         time.sleep(10)
 
                         # เริ่มค้นหา event.png
@@ -800,35 +968,56 @@ def device_worker(device):
                                         device.shell(f"input tap {pos[0][0]} {pos[0][1]}")
                                         time.sleep(2)
                                         
-                                        # เริ่มกดปุ่ม BACK รัวๆ
-                                        print(f"Device {device.serial}: เริ่มกดปุ่ม BACK รัวๆ...")
+                                        # เริ่มกดปุ่ม BACK รัวๆ - ระหว่างกดถ้าเจอ event.png ให้คลิกเลย
+                                        # หยุดเมื่อเจอ mainstage.png แล้วค่อยเริ่มทำงาน 7day
+                                        print(f"Device {device.serial}: เริ่มกดปุ่ม BACK รัวๆ (รอจนเจอ mainstage.png)...")
                                         back_count = 0
-                                        max_back_presses = 50  # จำนวนครั้งที่จะกด BACK
-                                        
-                                        for i in range(max_back_presses):
-                                            print(f"Device {device.serial}: กดปุ่ม BACK ครั้งที่ {i + 1}/{max_back_presses}")
+                                        max_back_presses = 100  # กันลูปค้าง
+                                        back_done = False
+
+                                        while back_count < max_back_presses:
+                                            back_count += 1
+                                            print(f"Device {device.serial}: กดปุ่ม BACK ครั้งที่ {back_count}")
                                             device.shell("input keyevent KEYCODE_BACK")
-                                            
-                                            # ตรวจสอบหา cancel.png หลังจากกด BACK แต่ละครั้ง
+
                                             try:
                                                 cap = device.screencap()
                                                 image = np.frombuffer(cap, dtype=np.uint8)
                                                 check_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
-                                                cancel_pos = ImgSearchADB(check_img, 'img/cancel.png')
-                                                
-                                                if cancel_pos:
-                                                    print(f"Device {device.serial}: พบ cancel.png หลังจากกด BACK {i + 1} ครั้ง")
-                                                    device.shell(f"input tap {cancel_pos[0][0]} {cancel_pos[0][1]}")
-                                                    back_pressed = True
-                                                    print(f"Device {device.serial}: กดปุ่ม cancel แล้ว")
+
+                                                # เจอ mainstage.png = ถึงหน้าหลักแล้ว หยุดกด BACK แล้วไปเริ่ม 7day
+                                                pos_mainstage_check = ImgSearchADB(check_img, mainstage_path)
+                                                if pos_mainstage_check:
+                                                    print(f"Device {device.serial}: เจอ mainstage.png หยุดกด BACK เริ่มทำงาน 7day")
+                                                    back_done = True
                                                     break
+
+                                                # เจอ cancel.png ให้กดแล้วกด BACK ต่อ (ไม่หยุด)
+                                                cancel_pos = ImgSearchADB(check_img, 'img/cancel.png')
+                                                if cancel_pos:
+                                                    print(f"Device {device.serial}: พบ cancel.png กดแล้ว BACK ต่อ")
+                                                    device.shell(f"input tap {cancel_pos[0][0]} {cancel_pos[0][1]}")
+
+                                                # หา event.png ไปด้วยระหว่างกด BACK - เจอแล้วคลิกเลย
+                                                event_pos = ImgSearchADB(check_img, 'img/event.png')
+                                                if event_pos:
+                                                    print(f"Device {device.serial}: เจอ event.png ระหว่างกด BACK คลิกเลย")
+                                                    device.shell(f"input tap {event_pos[0][0]} {event_pos[0][1]}")
+                                                    time.sleep(1)
                                             except Exception as e:
-                                                print(f"Device {device.serial}: ข้อผิดพลาดในการค้นหา cancel.png: {e}")
-                                        
-                                        if back_pressed:
-                                            print(f"Device {device.serial}: เสร็จสิ้นการกดปุ่ม BACK")
+                                                print(f"Device {device.serial}: ข้อผิดพลาดระหว่างกด BACK: {e}")
+
+                                        if back_done:
+                                            back_pressed = True
+                                            print(f"Device {device.serial}: เสร็จสิ้นการกดปุ่ม BACK (กดไป {back_count} ครั้ง)")
                                             print(f"Device {device.serial}: เริ่มค้นหา sequence_images...")
                                             break
+
+                                        # กดครบเพดานแล้วยังไปต่อไม่ได้ - หยุดแล้วกลับไปหา event ใหม่อีกรอบ
+                                        print(f"Device {device.serial}: กด BACK ครบ {max_back_presses} ครั้งแล้วยังไปต่อไม่ได้ กลับไปหา event ใหม่...")
+                                        event_start_time = None
+                                        event_found_continuously = False
+                                        continue
                                     else:
                                         remaining = EVENT_WAIT - (time.time() - event_start_time)
                                         print(f"Device {device.serial}: รอ event.png... ({int(remaining)} วินาที)")
@@ -862,25 +1051,108 @@ def device_worker(device):
                                             print(f"Device {device.serial}: คลิก box3.png")
                                             device.shell(f"input tap {pos[0][0]} {pos[0][1]}")
                                             time.sleep(5)
-                                            
-                                            if backup_game_data(device):
-                                                print(f"\nDevice {device.serial}: === เริ่มต้นกระบวนการใหม่ ===")
-                                                print(f"Device {device.serial}: Clear App...")
-                                                device.shell("am force-stop com.linecorp.LGRGS")
-                                                time.sleep(2)
-                                                device.shell("su -c 'rm /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
-                                                time.sleep(2)
-                                                
-                                                print(f"Device {device.serial}: เปิดแอพใหม่...")
-                                                device.shell("monkey -p com.linecorp.LGRGS 1")
-                                                time.sleep(5)
-                                                
+
+                                            # กด ESC (BACK) รัวๆ จนกว่าจะเจอ cancel.png ค่อยหยุด
+                                            print(f"Device {device.serial}: เริ่มกด ESC รัวๆ จนกว่าจะเจอ cancel.png...")
+                                            esc_count = 0
+                                            max_esc_presses = 100  # กันลูปค้าง
+                                            while esc_count < max_esc_presses:
+                                                esc_count += 1
+                                                print(f"Device {device.serial}: กด ESC ครั้งที่ {esc_count}")
+                                                device.shell("input keyevent KEYCODE_BACK")
+                                                try:
+                                                    cap = device.screencap()
+                                                    image = np.frombuffer(cap, dtype=np.uint8)
+                                                    check_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                                    cancel_pos = ImgSearchADB(check_img, 'img/cancel.png')
+                                                    if cancel_pos:
+                                                        print(f"Device {device.serial}: พบ cancel.png หลังกด ESC {esc_count} ครั้ง หยุดกด")
+                                                        device.shell(f"input tap {cancel_pos[0][0]} {cancel_pos[0][1]}")
+                                                        time.sleep(2)
+                                                        break
+                                                except Exception as e:
+                                                    print(f"Device {device.serial}: ข้อผิดพลาดระหว่างกด ESC: {e}")
+
+                                            # ทำงานตามลำดับ coyp-id1 -> coyp-id2 แล้วอ่าน UID ด้วย OCR
+                                            copied_uid = None
+                                            copy_sequence = ['img/coyp-id1.bmp', 'img/coyp-id2.bmp']
+                                            for copy_img in copy_sequence:
+                                                copy_found = False
+                                                for copy_attempt in range(30):  # รอรูปละไม่เกิน 30 รอบ
+                                                    try:
+                                                        cap = device.screencap()
+                                                        image = np.frombuffer(cap, dtype=np.uint8)
+                                                        copy_screen = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                                        copy_pos = ImgSearchADB(copy_screen, copy_img)
+                                                        if copy_pos:
+                                                            print(f"Device {device.serial}: พบ {copy_img} กดเลย")
+                                                            device.shell(f"input tap {copy_pos[0][0]} {copy_pos[0][1]}")
+                                                            if copy_img == 'img/coyp-id2.bmp':
+                                                                # หลังกด coyp-id2 รอ 5 วิ แล้วอ่าน UID จากหน้าจอด้วย OCR
+                                                                print(f"Device {device.serial}: รอ 5 วินาทีก่อนอ่าน UID ด้วย OCR...")
+                                                                time.sleep(5)
+                                                                copied_uid = read_uid_ocr(device)
+                                                                if not copied_uid:
+                                                                    # OCR เฟล - ใช้วิธีกด coyp-id3 อ่านจาก clipboard แทน
+                                                                    print(f"Device {device.serial}: OCR เฟล เปลี่ยนไปใช้วิธีกด coyp-id3 + clipboard...")
+                                                                    copied_uid = copy_uid_via_id3(device)
+                                                            else:
+                                                                time.sleep(2)
+                                                            copy_found = True
+                                                            break
+                                                        time.sleep(1)
+                                                    except Exception as e:
+                                                        print(f"Device {device.serial}: ข้อผิดพลาดในการค้นหา {copy_img}: {e}")
+                                                        time.sleep(1)
+                                                if not copy_found:
+                                                    print(f"Device {device.serial}: ไม่พบ {copy_img} ข้ามขั้นตอน copy UID")
+                                                    break
+
+                                            # ส่งไฟล์ออก (backup) โดยใช้ UID ตั้งชื่อไฟล์ เช่น noradom+[409f99e9]+_LINE_COCOS_PREF_KEY.xml
+                                            if backup_game_data(device, copied_uid):
+                                                # หลังส่งไฟล์ออกแล้ว ทำขั้นตอนเดียวกับตอนเริ่มบอท แล้วค่อยเริ่มรอบใหม่
+                                                # (ถ้าหา guestlogin เกิน 30 ครั้งไม่เจอ จะปิดแอพแล้วเริ่มใหม่ตั้งแต่ลบไฟล์เอง)
+                                                reset_app_and_login(device, CLEAR_APP_WAIT)
+
                                                 # รีเซ็ตตัวแปรทั้งหมด
                                                 last_image_found_time = time.time()
                                                 tried_mainstage = False
                                                 mainstage_attempts = 0
                                                 break  # ออกจากลูป sequence_images
                                         
+                                        elif seq_img == 'img/7day.png':
+                                            # แวะหา cancel.png 8 วินาทีก่อนกด 7day
+                                            print(f"Device {device.serial}: แวะหา cancel.png 8 วินาทีก่อนกด 7day...")
+                                            cancel_hunt_start = time.time()
+                                            while time.time() - cancel_hunt_start < 8:
+                                                try:
+                                                    cap = device.screencap()
+                                                    image = np.frombuffer(cap, dtype=np.uint8)
+                                                    hunt_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                                    hunt_cancel = ImgSearchADB(hunt_img, 'img/cancel.png')
+                                                    if hunt_cancel:
+                                                        print(f"Device {device.serial}: พบ cancel.png กดปิดก่อน")
+                                                        device.shell(f"input tap {hunt_cancel[0][0]} {hunt_cancel[0][1]}")
+                                                        time.sleep(1)
+                                                except Exception as e:
+                                                    print(f"Device {device.serial}: ข้อผิดพลาดระหว่างหา cancel.png: {e}")
+                                                time.sleep(0.5)
+
+                                            # ถ่ายจอใหม่แล้วค่อยกด 7day (ตำแหน่งอาจเปลี่ยนหลังปิด popup)
+                                            print(f"Device {device.serial}: ครบ 8 วินาที กด 7day.png")
+                                            try:
+                                                cap = device.screencap()
+                                                image = np.frombuffer(cap, dtype=np.uint8)
+                                                fresh_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                                new_pos = ImgSearchADB(fresh_img, 'img/7day.png')
+                                            except Exception:
+                                                new_pos = None
+                                            if new_pos:
+                                                device.shell(f"input tap {new_pos[0][0]} {new_pos[0][1]}")
+                                            else:
+                                                device.shell(f"input tap {pos[0][0]} {pos[0][1]}")
+                                            time.sleep(CLICK_DELAY)
+
                                         else:
                                             device.shell(f"input tap {pos[0][0]} {pos[0][1]}")
                                             time.sleep(CLICK_DELAY)
@@ -910,7 +1182,7 @@ def device_worker(device):
                                 print(f"Device {device.serial}: พบ fixbugicon ทำการ Clear App...")
                                 device.shell("am force-stop com.linecorp.LGRGS")
                                 time.sleep(2)
-                                device.shell("monkey -p com.linecorp.LGRGS 1")
+                                open_app(device)
                                 time.sleep(10)
                                 mainstage_attempts += 1
                                 continue
@@ -973,7 +1245,7 @@ def device_worker(device):
                                     print(f"Device {device.serial}: [1/3] Clear App...")
                                     device.shell("am force-stop com.linecorp.LGRGS")
                                     time.sleep(2)
-                                    device.shell("su -c 'rm /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
+                                    device.shell("su -c 'rm -rf /data/data/com.linecorp.LGRGS/shared_prefs /data/data/com.linecorp.LGRGS/files /data/data/com.linecorp.LGRGS/databases /data/data/com.linecorp.LGRGS/no_backup /data/data/com.linecorp.LGRGS/app_webview /data/data/com.linecorp.LGRGS/app_pccache /data/data/com.linecorp.LGRGS/app_tmppccache /data/data/com.linecorp.LGRGS/app_textures /data/data/com.linecorp.LGRGS/cache /data/data/com.linecorp.LGRGS/code_cache'")  # ลบข้อมูลภายในทั้งหมด แต่เก็บทรัพยากรเกม 1.5GB ใน /sdcard ไว้
                                     time.sleep(2)
                                     
                                     print(f"Device {device.serial}: [2/3] รอ {CLEAR_APP_WAIT} วินาที...")
@@ -982,7 +1254,7 @@ def device_worker(device):
                                         time.sleep(1)
                                     
                                     print(f"Device {device.serial}: [3/3] เปิดแอพใหม่...")
-                                    device.shell("monkey -p com.linecorp.LGRGS 1")
+                                    open_app(device)
                                     time.sleep(5)
                                     
                                     # รีเซ็ตตัวแปรทั้งหมด
@@ -1019,7 +1291,27 @@ def device_worker(device):
                                 elif 'sing.png' in img_path:
                                     device.shell(f"input tap {pos[0][0]} {pos[0][1]}")
                                     perform_sing_actions(device)
-                                
+
+                                elif 'saveteam.png' in img_path:
+                                    print(f"\nDevice {device.serial}: === พบ saveteam.png กด save team ===")
+                                    device.shell(f"input tap {pos[0][0]} {pos[0][1]}")
+                                    time.sleep(3)
+
+                                    # หลังจบ save team: ปิดแอพแล้วเปิดใหม่เลย (ไม่ลบข้อมูล)
+                                    print(f"Device {device.serial}: ปิดแอพหลัง save team...")
+                                    device.shell("am force-stop com.linecorp.LGRGS")
+                                    time.sleep(2)
+                                    print(f"Device {device.serial}: เปิดแอพใหม่...")
+                                    open_app(device)
+                                    time.sleep(10)
+
+                                    # รีเซ็ตสถานะให้กลับไปหาและกด mainstage.png ใหม่
+                                    # ถ้าระหว่างนั้นเจอ steage2.png จะกระโดดเข้าขั้นตอน steage2 ต่อเองตามปกติ
+                                    tried_mainstage = False
+                                    mainstage_attempts = 0
+                                    last_image_found_time = time.time()
+                                    break
+
                                 elif 'herodrag.png' in img_path:
                                     print(f"Device {device.serial}: ลาก herodrag")
                                     device.shell("input swipe 484 200 503 387 100")
@@ -1045,7 +1337,7 @@ def device_worker(device):
                             print(f"Device {device.serial}: Clear App...")
                             device.shell("am force-stop com.linecorp.LGRGS")
                             time.sleep(2)
-                            device.shell("su -c 'rm /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
+                            device.shell("su -c 'rm -rf /data/data/com.linecorp.LGRGS/shared_prefs /data/data/com.linecorp.LGRGS/files /data/data/com.linecorp.LGRGS/databases /data/data/com.linecorp.LGRGS/no_backup /data/data/com.linecorp.LGRGS/app_webview /data/data/com.linecorp.LGRGS/app_pccache /data/data/com.linecorp.LGRGS/app_tmppccache /data/data/com.linecorp.LGRGS/app_textures /data/data/com.linecorp.LGRGS/cache /data/data/com.linecorp.LGRGS/code_cache'")  # ลบข้อมูลภายในทั้งหมด แต่เก็บทรัพยากรเกม 1.5GB ใน /sdcard ไว้
                             time.sleep(2)
                             
                             print(f"Device {device.serial}: รอ {CLEAR_APP_WAIT} วินาที")
@@ -1054,16 +1346,13 @@ def device_worker(device):
                                 time.sleep(1)
                             
                             print(f"Device {device.serial}: เปิดแอพใหม่...")
-                            device.shell("monkey -p com.linecorp.LGRGS 1")
+                            open_app(device)
                             time.sleep(5)
                             
                             last_image_found_time = time.time()
                             tried_mainstage = False
                             mainstage_attempts = 0
                             break  # ออกจากลูปปัจจุบันเพื่อเริ่มต้นใหม่
-                        else:
-                            remaining_time = no_image_timeout - (time.time() - last_image_found_time)
-                            print(f"Device {device.serial}: ไม่พบรูปภาพ (เหลือ {int(remaining_time)} วินาที)")
                     
                     time.sleep(SEARCH_INTERVAL)
                     
@@ -1157,14 +1446,6 @@ def monitor_screen_color(device):
                 
                 # ตรวจสอบสี
                 screen_percentage, is_gray_screen = check_screen_color(adb_img)
-                
-                # แสดงผลด้วยสีที่แตกต่างกันตามระดับ
-                if screen_percentage >= 80:
-                    print(f"\033[91mDevice {device.serial}: สีเทา (0x303030): {screen_percentage:.2f}% [สูง]\033[0m")
-                elif screen_percentage >= 50:
-                    print(f"\033[93mDevice {device.serial}: สีเทา (0x303030): {screen_percentage:.2f}% [ปานกลาง]\033[0m")
-                else:
-                    print(f"\033[92mDevice {device.serial}: สีเทา (0x303030): {screen_percentage:.2f}% [ต่ำ]\033[0m")
                 
                 last_check_time = current_time
             
