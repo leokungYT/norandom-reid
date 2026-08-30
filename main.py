@@ -451,54 +451,56 @@ def connect_to_mumu():
         subprocess.run([ADB, "start-server"], capture_output=True, timeout=3)
         time.sleep(1)
         
-        all_ports = set()
+        # === วิธีเดียวกับ login.py: brute-force สแกนช่วง port แล้ว adb connect ทุกตัว ===
+        # เล็งเฉพาะช่วง MuMu (16384-17416) ที่บอทนี้ใช้ - ไม่แตะช่วง 5555+ กันไปชนบอทอื่น/LDPlayer
+        candidate_ports = list(range(16384, 17417))
 
-        # แหล่งหลัก: MuMuManager (แม่นสุด บอกทุกเครื่องที่รันอยู่)
-        all_ports.update(get_ports_from_mumu_manager())
+        # จาก MuMuManager ด้วย (แม่นสุด รวมเข้าไปในชุดที่จะยิงเชื่อม)
+        for p in get_ports_from_mumu_manager():
+            try:
+                candidate_ports.append(int(p))
+            except ValueError:
+                pass
+        candidate_ports = sorted(set(candidate_ports))
 
-        # แหล่งสำรอง: สแกนหลายทางพร้อมกัน (เผื่อ MuMuManager ไม่มี/เป็น emulator อื่น)
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            config_ports = executor.submit(scan_mumu_directory)
-            netstat_ports = executor.submit(scan_ports_from_netstat)
-            process_ports = executor.submit(lambda: [port for _, port in find_mumu_processes()])
-            active_ports = executor.submit(find_mumu_adb_ports)
+        # กรองเร็วด้วย socket ก่อน - เอาเฉพาะ port ที่เปิดฟังจริง (ไม่ต้อง adb connect port ที่ปิด)
+        def is_open(port):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.15)
+                ok = sock.connect_ex(('127.0.0.1', port)) == 0
+                sock.close()
+                return port if ok else None
+            except Exception:
+                return None
 
-            all_ports.update(config_ports.result())
-            all_ports.update(netstat_ports.result())
-            all_ports.update(process_ports.result())
-            all_ports.update(active_ports.result())
+        open_ports = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+            for r in executor.map(is_open, candidate_ports):
+                if r:
+                    open_ports.append(r)
 
-        # กันตกหล่น: กวาดช่วง port มาตรฐานของ MuMu (16384 + n*32) เฉพาะ port ที่เปิดฟังจริง
-        for port in range(16384, 17408, 32):
-            for p in (port, port + 1):
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(0.05)
-                    if sock.connect_ex(('127.0.0.1', p)) == 0:
-                        all_ports.add(str(p))
-                    sock.close()
-                except Exception:
-                    pass
+        print(f"\n--- [ADB] สแกนพบ port ที่เปิดอยู่ {len(open_ports)} port: {sorted(open_ports)} ---")
 
-        print(f"รวม ports ที่จะลองเชื่อมต่อ: {sorted(all_ports)}")
-
-        # เชื่อมต่อกับทุก port พร้อมกัน
+        # ยิง adb connect ทุก port ที่เปิด พร้อมกัน (50 workers แบบ login.py) เช็คคำว่า connected
         adb = AdbClient(host="127.0.0.1", port=5037)
 
         def try_connect_port(port):
             try:
-                subprocess.run(
-                    [ADB, "connect", f"127.0.0.1:{port}"],
-                    capture_output=True,
-                    timeout=5
-                )
+                addr = f"127.0.0.1:{port}"
+                result = subprocess.run([ADB, "connect", addr],
+                                        capture_output=True, timeout=5, text=True)
+                out = (result.stdout or "").lower()
+                if ("connected" in out) and "cannot" not in out:
+                    return addr
             except Exception:
                 pass
+            return None
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            list(executor.map(try_connect_port, all_ports))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+            list(executor.map(try_connect_port, open_ports))
 
-        # รอให้ทุกเครื่องขึ้นสถานะ device (ไม่ใช่ offline) ก่อน - retry สูงสุด 5 รอบ
+        # รอให้ทุกเครื่องขึ้นสถานะ device (ไม่ใช่ offline) - retry สูงสุด 5 รอบ + reconnect ตัวที่ยัง offline
         connected_devices = []
         for attempt in range(5):
             connected_devices = []
@@ -524,7 +526,7 @@ def connect_to_mumu():
                     pass
             time.sleep(2)
 
-        print(f"เชื่อมต่อสำเร็จ {len(connected_devices)} เครื่อง: {[d.serial for d in connected_devices]}")
+        print(f"เชื่อมต่อสำเร็จ {len(connected_devices)} เครื่อง: {sorted(d.serial for d in connected_devices)}")
 
         if connected_devices:
             return adb, connected_devices if len(connected_devices) > 1 else connected_devices[0]
