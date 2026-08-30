@@ -758,6 +758,21 @@ def fast_screencap(device):
 _pos_memory = {}
 
 
+def clear_all_state():
+    """ล้าง cache/สถานะที่จำไว้ทั้งหมด เริ่มรอบใหม่แบบสะอาด กันค่าเก่าจากบัญชีก่อนหน้าค้าง"""
+    try:
+        _pos_memory.clear()                    # ลืมตำแหน่งเก่า - สแกนหาใหม่หมด
+        _gray_tls.__dict__.clear()             # ล้าง cache ภาพขาวดำของ thread นี้
+        try:
+            image_cache.access_times.clear()   # รีเซ็ตสถิติการใช้ template
+        except Exception:
+            pass
+        gc.collect()                            # คืน memory
+        print("ล้าง cache/สถานะทั้งหมดแล้ว - เริ่มรอบใหม่สะอาด")
+    except Exception as e:
+        print(f"ล้าง state ไม่สำเร็จ: {e}")
+
+
 def ImgSearchADB(adb_img, find_img_path, threshold=0.95, method=cv2.TM_CCOEFF_NORMED):
     try:
         find_img = image_cache.get_image(find_img_path)  # ใช้ cache แทน (เป็นภาพขาวดำแล้ว)
@@ -978,6 +993,8 @@ def reset_app_and_login(device, clear_app_wait=5):
     cycle = 0
     while True:
         cycle += 1
+        # ล้างค่าที่จำไว้ทั้งหมดก่อนเริ่มรอบใหม่ (ตำแหน่ง, cache, memory)
+        clear_all_state()
         print(f"\nDevice {device.serial}: === เริ่มกระบวนการลบข้อมูลภายในแอพ (รอบที่ {cycle}) ===")
         try:
             print(f"Device {device.serial}: [1/3] กำลังปิดแอพ...")
