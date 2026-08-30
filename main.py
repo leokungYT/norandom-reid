@@ -753,9 +753,34 @@ def _screen_to_gray(adb_img):
     return gray
 
 
+# === Watchdog: ถ้าเครื่องไหนค้าง/ไม่คืบหน้าเกิน 25 นาที ให้ล้างแอพเริ่มใหม่ตั้งแต่ลบไฟล์ ===
+STUCK_TIMEOUT = 1500  # 25 นาที (วินาที)
+_last_activity = {}   # serial -> เวลาที่คืบหน้าล่าสุด
+
+
+class StuckTimeoutError(BaseException):
+    """เครื่องค้างเกิน STUCK_TIMEOUT - ต้อง reset ใหม่ทั้งหมด
+    (สืบจาก BaseException เพื่อไม่ให้ except Exception ทั่วไปในลูปกลืนทิ้ง - จะลอยขึ้นไปถึง device_worker)"""
+    pass
+
+
+def mark_activity(device):
+    """บันทึกว่าเครื่องนี้เพิ่งมีความคืบหน้า (เจอรูป/กดปุ่ม/เริ่มรอบใหม่)"""
+    _last_activity[device.serial] = time.time()
+
+
+def check_stuck(device):
+    """เช็คว่าเครื่องค้างเกิน 25 นาทีไหม - ถ้าใช่ raise StuckTimeoutError
+    เรียกจาก fast_screencap ซึ่งถูกเรียกทุกเฟส (ทั้งตอน login และตอนเล่น) จึงจับได้ตั้งแต่เริ่ม"""
+    last = _last_activity.get(device.serial)
+    if last is not None and time.time() - last > STUCK_TIMEOUT:
+        raise StuckTimeoutError(f"{device.serial} ค้างเกิน {STUCK_TIMEOUT} วินาที (25 นาที)")
+
+
 def fast_screencap(device):
     """จับหน้าจอแบบ raw (ไม่ encode PNG) = เร็วกว่ามาก แล้วคืนภาพ BGR (แบบเดียวกับ login.py)
     ถ้า raw ใช้ไม่ได้ fallback ไป PNG/ppadb ให้เอง"""
+    check_stuck(device)  # จับเครื่องค้าง 25 นาที (ทำงานทุกเฟส เพราะ fast_screencap ถูกเรียกทุกที่)
     try:
         kwargs = {}
         if os.name == "nt":
@@ -1025,6 +1050,7 @@ def reset_app_and_login(device, clear_app_wait=5):
     cycle = 0
     while True:
         cycle += 1
+        mark_activity(device)  # เริ่มรอบใหม่ = มีความคืบหน้า (รีเซ็ตนาฬิกา watchdog 25 นาที)
         # ล้างค่าที่จำไว้ทั้งหมดก่อนเริ่มรอบใหม่ (ตำแหน่ง, cache, memory)
         clear_all_state()
         print(f"\nDevice {device.serial}: === เริ่มกระบวนการลบข้อมูลภายในแอพ (รอบที่ {cycle}) ===")
@@ -1092,7 +1118,7 @@ def device_worker(device):
 
             # ตัวแปรสำหรับการติดตามสถานะ
             last_image_found_time = time.time()
-            no_image_timeout = 1200  # ไม่พบรูปภาพเกิน 1200 วินาที ค่อยรีสตาร์ทแอพ
+            no_image_timeout = 1500  # ไม่พบรูปภาพเกิน 1500 วินาที (25 นาที) ค่อยเริ่มใหม่ตั้งแต่ลบไฟล์
             mainstage_attempts = 0
             max_mainstage_attempts = 10
                                 # เพิ่มตัวแปรด้านบนของฟังก์ชัน device_worker
@@ -1582,30 +1608,20 @@ def device_worker(device):
                             print(f"Device {device.serial}: ข้อผิดพลาด {img_path}: {e}")
                             continue
 
-                    # ตรวจสอบ timeout
+                    # ถ้าเจอรูป = มีความคืบหน้า -> รีเซ็ตนาฬิกา watchdog 25 นาที
+                    if found_any_image:
+                        mark_activity(device)
+
+                    # ตรวจสอบ timeout: ไม่พบรูปเกินกำหนด -> ล้างแอพเริ่มใหม่ตั้งแต่ลบไฟล์ (full reset + relogin)
                     if not found_any_image:
                         if time.time() - last_image_found_time > no_image_timeout:
-                            print(f"\nDevice {device.serial}: === ไม่พบรูปภาพเกิน {no_image_timeout} วินาที ===")
-                            print(f"Device {device.serial}: Clear App...")
-                            device.shell("am force-stop com.linecorp.LGRGS")
-                            time.sleep(2)
-                            device.shell("su -c 'rm -rf /data/data/com.linecorp.LGRGS/shared_prefs /data/data/com.linecorp.LGRGS/files /data/data/com.linecorp.LGRGS/databases /data/data/com.linecorp.LGRGS/no_backup /data/data/com.linecorp.LGRGS/app_webview /data/data/com.linecorp.LGRGS/app_pccache /data/data/com.linecorp.LGRGS/app_tmppccache /data/data/com.linecorp.LGRGS/app_textures /data/data/com.linecorp.LGRGS/cache /data/data/com.linecorp.LGRGS/code_cache'")  # ลบข้อมูลภายในทั้งหมด แต่เก็บทรัพยากรเกม 1.5GB ใน /sdcard ไว้
-                            time.sleep(2)
-                            
-                            print(f"Device {device.serial}: รอ {CLEAR_APP_WAIT} วินาที")
-                            for i in range(CLEAR_APP_WAIT, 0, -1):
-                                print(f"Device {device.serial}: เหลือเวลา {i} วินาที")
-                                time.sleep(1)
-                            
-                            print(f"Device {device.serial}: เปิดแอพใหม่...")
-                            open_app(device)
-                            time.sleep(5)
-                            
+                            print(f"\nDevice {device.serial}: === ไม่พบรูปภาพเกิน {no_image_timeout} วินาที - เริ่มใหม่ตั้งแต่ลบไฟล์ ===")
+                            reset_app_and_login(device, CLEAR_APP_WAIT)
                             last_image_found_time = time.time()
                             tried_mainstage = False
                             mainstage_attempts = 0
                             break  # ออกจากลูปปัจจุบันเพื่อเริ่มต้นใหม่
-                    
+
                     time.sleep(SEARCH_INTERVAL)
                     
                 except Exception as e:
@@ -1615,6 +1631,11 @@ def device_worker(device):
                         print(f"Device {device.serial}: อุปกรณ์หลุด กำลังเชื่อมต่อใหม่...")
                         break
 
+        except StuckTimeoutError as e:
+            # เครื่องค้างเกิน 25 นาที (จับได้จากทุกเฟส รวมถึงตอน login) -> วนกลับไปต้น while
+            # ซึ่งจะเรียก reset_app_and_login (ลบไฟล์ + เปิดแอพ + login ใหม่) เอง
+            print(f"\nDevice {device.serial}: === {e} === ล้างแอพเริ่มใหม่ตั้งแต่ลบไฟล์")
+            continue
         except Exception as e:
             print(f"Device {device.serial}: ข้อผิดพลาดร้ายแรง: {e}")
             time.sleep(5)
