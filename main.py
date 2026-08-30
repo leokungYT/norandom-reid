@@ -80,7 +80,37 @@ def debug_match_score(adb_img, find_img_path):
         return None
 
 # ตั้งค่า Tesseract OCR สำหรับอ่าน UID จากหน้าจอ (แต่ละเครื่องอ่านจอตัวเอง แยกขาดกัน ไม่ใช้ clipboard)
-pytesseract.pytesseract.tesseract_cmd = r"C:\Users\Administrator\Downloads\CookieRun\src\Tesseract-OCR\tesseract.exe"
+# หา tesseract.exe อัตโนมัติหลายที่ - เครื่องฟาร์มไม่ต้องติดตั้ง/ตั้ง PATH เอง
+def _find_tesseract():
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "Tesseract-OCR", "tesseract.exe"),   # แถมมากับบอท (ผ่าน autoupdate) - อันหลัก
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        r"C:\Users\Administrator\Downloads\CookieRun\src\Tesseract-OCR\tesseract.exe",
+    ]
+    # เช็คไฟล์ตรงๆ ก่อน (bundled อยู่อันแรก - เจอก็จบเร็ว)
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    # ไม่เจอ ค่อยลองจาก PATH
+    try:
+        kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+        found = subprocess.run(["where", "tesseract"], capture_output=True, text=True, timeout=5, **kwargs).stdout.strip().splitlines()
+        for f in found:
+            if f.strip() and os.path.exists(f.strip()):
+                return f.strip()
+    except Exception:
+        pass
+    return None
+
+TESSERACT_PATH = _find_tesseract()
+OCR_AVAILABLE = TESSERACT_PATH is not None
+if OCR_AVAILABLE:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    print(f"ใช้ Tesseract OCR ที่: {TESSERACT_PATH}")
+else:
+    print("!!! ไม่พบ Tesseract OCR บนเครื่องนี้ - จะใช้วิธี coyp-id3 (clipboard) อ่าน UID แทน !!!")
 
 # ตำแหน่งข้อความ UID บนหน้าจอหลังกด coyp-id2 (x, y, กว้าง, สูง)
 UID_REGION = (392, 238, 209, 43)
@@ -100,6 +130,8 @@ def read_uid_ocr(device):
     """อ่าน UID จากหน้าจอของเครื่องนั้นๆ ด้วย OCR ตามตำแหน่ง UID_REGION
     วิธี: แยกตัวอักษรสีเหลืองออกจากพื้นหลัง ตัดทีละตัว แล้ว OCR ทีละตัวอักษร
     (ทดสอบแล้วแม่นกว่าอ่านทั้งบรรทัด ซึ่งชอบตกเลข 1 ท้ายและอ่านเลข 0 เป็นตัว O)"""
+    if not OCR_AVAILABLE:
+        return None  # ไม่มี Tesseract - ให้ไปใช้ coyp-id3 แทน
     try:
         screen = fast_screencap(device)
         x, y, w, h = UID_REGION
