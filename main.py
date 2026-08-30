@@ -777,6 +777,30 @@ def check_stuck(device):
         raise StuckTimeoutError(f"{device.serial} ค้างเกิน {STUCK_TIMEOUT} วินาที (25 นาที)")
 
 
+# === เฝ้า checkpoint-click.bmp แบบลอยๆ: ถ้าค้างบนจอต่อเนื่องเกิน 45 วิ ให้เริ่มใหม่ตั้งแต่ลบไฟล์ ===
+CHECKPOINT_STUCK_TIMEOUT = 45  # วินาที
+_checkpoint_since = {}  # serial -> เวลาที่เริ่มเห็น checkpoint-click ต่อเนื่อง
+
+
+def check_checkpoint_stuck(device, adb_img):
+    """หา checkpoint-click.bmp แบบลอยๆ ทุกครั้ง - ถ้ามันค้างบนจอต่อเนื่องเกิน 45 วิ
+    (กดแล้วไม่ยอมหาย = ค้าง) ให้ raise StuckTimeoutError เพื่อ reset ทั้งหมด"""
+    try:
+        found = ImgSearchADB(adb_img, 'img/checkpoint-click.bmp', threshold=0.9)
+    except Exception:
+        return
+    now = time.time()
+    if found:
+        first = _checkpoint_since.get(device.serial)
+        if first is None:
+            _checkpoint_since[device.serial] = now
+        elif now - first >= CHECKPOINT_STUCK_TIMEOUT:
+            _checkpoint_since[device.serial] = None
+            raise StuckTimeoutError(f"{device.serial} checkpoint-click ค้างเกิน {CHECKPOINT_STUCK_TIMEOUT} วินาที")
+    elif _checkpoint_since.get(device.serial) is not None:
+        _checkpoint_since[device.serial] = None  # ไม่เจอแล้ว - รีเซ็ตตัวจับเวลา
+
+
 def fast_screencap(device):
     """จับหน้าจอแบบ raw (ไม่ encode PNG) = เร็วกว่ามาก แล้วคืนภาพ BGR (แบบเดียวกับ login.py)
     ถ้า raw ใช้ไม่ได้ fallback ไป PNG/ppadb ให้เอง"""
@@ -940,6 +964,8 @@ def perform_sing_actions(device):
                         checkpoint_attempt += 1
                         print(f"Device {device.serial}: กำลังรอ checkpoint-click (ครั้งที่ {checkpoint_attempt})")
                         adb_img = fast_screencap(device)
+                        # ค้างที่ checkpoint เกิน 45 วิ (กดแล้วไม่หาย) -> เริ่มใหม่ตั้งแต่ลบไฟล์
+                        check_checkpoint_stuck(device, adb_img)
                         pos_checkpoint = ImgSearchADB(adb_img, 'img/checkpoint-click.bmp')
                         if pos_checkpoint:
                             print(f"\nDevice {device.serial}: === พบ checkpoint-click กดเลย ===")
@@ -1173,7 +1199,8 @@ def device_worker(device):
                     adb_img = fast_screencap(device)
                     found_any_image = False
 
-
+                    # หา checkpoint-click แบบลอยๆ ทุกครั้ง - ค้างเกิน 45 วิ ให้เริ่มใหม่ตั้งแต่ลบไฟล์
+                    check_checkpoint_stuck(device, adb_img)
 
                     # ในส่วนของการตรวจสอบสีหน้าจอ:
                     screen_percentage, is_gray_screen = check_screen_color(adb_img)
