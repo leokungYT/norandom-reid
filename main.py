@@ -981,7 +981,7 @@ def device_worker(device):
 
             # ตัวแปรสำหรับการติดตามสถานะ
             last_image_found_time = time.time()
-            no_image_timeout = 400
+            no_image_timeout = 1200  # ไม่พบรูปภาพเกิน 1200 วินาที ค่อยรีสตาร์ทแอพ
             mainstage_attempts = 0
             max_mainstage_attempts = 10
                                 # เพิ่มตัวแปรด้านบนของฟังก์ชัน device_worker
