@@ -16,6 +16,16 @@ import concurrent.futures
 import gc  # Add this with your other imports
 import pytesseract
 import pyperclip
+import json
+import glob
+import sys
+
+# กัน print ภาษาไทย crash เวลา stdout ถูก redirect ไปไฟล์/ไปป์ (locale cp1252/874)
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # สำหรับแผนสำรองอ่าน UID ผ่าน clipboard (ตอน OCR เฟล) - ต่อคิวทีละเครื่องกันค่าซ้อนกัน
 clipboard_lock = threading.Lock()
@@ -23,6 +33,11 @@ used_uids = set()
 
 # ทำงานจากโฟลเดอร์ของไฟล์นี้เสมอ - ไม่ว่าจะรันจาก shortcut/โฟลเดอร์ไหน path 'img/...' ก็ต้องเจอ
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+# ใช้ adb.exe ในโฟลเดอร์บอทเสมอ (adb มักไม่ได้อยู่ใน PATH ของเครื่องฟาร์ม)
+ADB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adb.exe")
+if not os.path.exists(ADB):
+    ADB = "adb"
 
 # รูปสำคัญที่บอทต้องใช้ - เช็คตอนเริ่มว่าโหลดได้จริง (ถ้าโหลดไม่ได้ ImgSearchADB จะเงียบและไม่กดอะไรเลย)
 REQUIRED_IMAGES = [
@@ -175,7 +190,7 @@ def find_mumu_adb_ports():
     """ค้นหา port ของ MuMu ADB ที่ active อยู่"""
     try:
         # รัน adb devices เพื่อดู list ของ devices ที่เชื่อมต่ออยู่
-        result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
+        result = subprocess.run([ADB, 'devices'], capture_output=True, text=True)
         # แสดงผลลัพธ์ทั้งหมดที่ได้จาก adb devices
         print("ผลลัพธ์จาก adb devices:")
         print(result.stdout)
@@ -331,7 +346,7 @@ def scan_all_possible_ports() -> List[str]:
                 
             try:
                 result = subprocess.run(
-                    ["adb", "connect", f"127.0.0.1:{port}"],
+                    [ADB, "connect", f"127.0.0.1:{port}"],
                     capture_output=True,
                     text=True,
                     timeout=2  # ลด timeout ลง
@@ -383,51 +398,134 @@ def scan_ports_from_netstat() -> List[str]:
 
 
 
+def find_mumu_manager():
+    """หา MuMuManager.exe ให้เจอไม่ว่าจะติดตั้ง MuMuPlayer หรือ MuMuPlayerGlobal เวอร์ชันไหน"""
+    fixed = [
+        r"C:\Program Files\Netease\MuMuPlayer\nx_main\MuMuManager.exe",
+        r"C:\Program Files\Netease\MuMuPlayerGlobal-12.0\nx_main\MuMuManager.exe",
+        r"C:\Program Files\Netease\MuMuPlayerGlobal-12.0\shell\MuMuManager.exe",
+    ]
+    for p in fixed:
+        if os.path.exists(p):
+            return p
+    # ค้นหาแบบกว้างใน Program Files ทั้งสองที่
+    for base in [os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", "")]:
+        if not base:
+            continue
+        hits = glob.glob(os.path.join(base, "Netease", "**", "MuMuManager.exe"), recursive=True)
+        if hits:
+            return hits[0]
+    return None
+
+
+def get_ports_from_mumu_manager():
+    """แหล่งที่แม่นสุด: ถาม MuMuManager ว่ามีเครื่องไหนรันอยู่บ้าง + adb_port ของแต่ละเครื่อง"""
+    exe = find_mumu_manager()
+    if not exe:
+        return []
+    try:
+        res = subprocess.run([exe, "info", "-v", "all"], capture_output=True, text=True, timeout=15)
+        data = json.loads(res.stdout)
+    except Exception as e:
+        print(f"MuMuManager อ่านข้อมูลไม่ได้: {e}")
+        return []
+
+    # info อาจคืน dict ของหลายเครื่อง หรือ dict เดียวเมื่อมีเครื่องเดียว
+    entries = data.values() if isinstance(data, dict) and not data.get("adb_port") else [data]
+    ports = []
+    for v in entries:
+        if isinstance(v, dict) and v.get("is_android_started") and v.get("adb_port"):
+            ports.append(str(v["adb_port"]))
+    if ports:
+        print(f"MuMuManager พบเครื่องที่รันอยู่ {len(ports)} เครื่อง: {sorted(ports)}")
+    return ports
+
+
 def connect_to_mumu():
     """เชื่อมต่อกับ MuMu Emulator แบบเร็วขึ้น"""
     try:
         print("\n=== เริ่มกระบวนการเชื่อมต่อ MuMu ===")
         
         # รีเซ็ต ADB server อย่างรวดเร็ว
-        subprocess.run(["adb", "kill-server"], capture_output=True, timeout=3)
-        subprocess.run(["adb", "start-server"], capture_output=True, timeout=3)
+        subprocess.run([ADB, "kill-server"], capture_output=True, timeout=3)
+        subprocess.run([ADB, "start-server"], capture_output=True, timeout=3)
         time.sleep(1)
         
         all_ports = set()
-        
-        # รวบรวม ports จากทุกแหล่งพร้อมกัน
+
+        # แหล่งหลัก: MuMuManager (แม่นสุด บอกทุกเครื่องที่รันอยู่)
+        all_ports.update(get_ports_from_mumu_manager())
+
+        # แหล่งสำรอง: สแกนหลายทางพร้อมกัน (เผื่อ MuMuManager ไม่มี/เป็น emulator อื่น)
         with concurrent.futures.ThreadPoolExecutor() as executor:
             config_ports = executor.submit(scan_mumu_directory)
             netstat_ports = executor.submit(scan_ports_from_netstat)
             process_ports = executor.submit(lambda: [port for _, port in find_mumu_processes()])
             active_ports = executor.submit(find_mumu_adb_ports)
-            
+
             all_ports.update(config_ports.result())
             all_ports.update(netstat_ports.result())
             all_ports.update(process_ports.result())
             all_ports.update(active_ports.result())
-        
+
+        # กันตกหล่น: กวาดช่วง port มาตรฐานของ MuMu (16384 + n*32) เฉพาะ port ที่เปิดฟังจริง
+        for port in range(16384, 17408, 32):
+            for p in (port, port + 1):
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(0.05)
+                    if sock.connect_ex(('127.0.0.1', p)) == 0:
+                        all_ports.add(str(p))
+                    sock.close()
+                except Exception:
+                    pass
+
+        print(f"รวม ports ที่จะลองเชื่อมต่อ: {sorted(all_ports)}")
+
         # เชื่อมต่อกับทุก port พร้อมกัน
-        connected_devices = []
         adb = AdbClient(host="127.0.0.1", port=5037)
-        
+
         def try_connect_port(port):
             try:
                 subprocess.run(
-                    ["adb", "connect", f"127.0.0.1:{port}"],
+                    [ADB, "connect", f"127.0.0.1:{port}"],
                     capture_output=True,
-                    timeout=2
+                    timeout=5
                 )
-                devices = adb.devices()
-                return [d for d in devices if f"127.0.0.1:{port}" in d.serial]
-            except:
-                return []
-        
+            except Exception:
+                pass
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [executor.submit(try_connect_port, port) for port in all_ports]
-            for future in concurrent.futures.as_completed(futures):
-                connected_devices.extend(future.result())
-        
+            list(executor.map(try_connect_port, all_ports))
+
+        # รอให้ทุกเครื่องขึ้นสถานะ device (ไม่ใช่ offline) ก่อน - retry สูงสุด 5 รอบ
+        connected_devices = []
+        for attempt in range(5):
+            connected_devices = []
+            offline = []
+            for d in adb.devices():
+                if "127.0.0.1" not in d.serial:
+                    continue
+                try:
+                    state = d.get_state()
+                except Exception:
+                    state = "offline"
+                if state == "device":
+                    connected_devices.append(d)
+                else:
+                    offline.append(d.serial)
+            if not offline:
+                break
+            print(f"รอเครื่องออนไลน์... (รอบ {attempt + 1}/5) ยัง offline: {offline}")
+            for serial in offline:
+                try:
+                    subprocess.run([ADB, "connect", serial], capture_output=True, timeout=5)
+                except Exception:
+                    pass
+            time.sleep(2)
+
+        print(f"เชื่อมต่อสำเร็จ {len(connected_devices)} เครื่อง: {[d.serial for d in connected_devices]}")
+
         if connected_devices:
             return adb, connected_devices if len(connected_devices) > 1 else connected_devices[0]
         return None, []
@@ -491,7 +589,7 @@ def backup_game_data(device, uid=None):
             
         print(f"\nDevice {device.serial}: กำลัง Pull ไฟล์...")
         result = subprocess.run(
-            ['adb', "-s", device_id, "pull", "/sdcard/temp_backup.xml", backup_path],
+            [ADB, "-s", device_id, "pull", "/sdcard/temp_backup.xml", backup_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=30
