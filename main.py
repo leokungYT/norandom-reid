@@ -19,6 +19,7 @@ import pyperclip
 import json
 import glob
 import sys
+import struct
 
 # กัน print ภาษาไทย crash เวลา stdout ถูก redirect ไปไฟล์/ไปป์ (locale cp1252/874)
 try:
@@ -68,12 +69,13 @@ def check_required_images():
 def debug_match_score(adb_img, find_img_path):
     """คืนค่า match สูงสุด (0-1) ของรูป template บนหน้าจอ - ใช้วินิจฉัยว่าทำไมหาไม่เจอ"""
     try:
-        tpl = cv2.imread(find_img_path, cv2.IMREAD_COLOR)
+        tpl = cv2.imread(find_img_path, cv2.IMREAD_GRAYSCALE)
         if tpl is None:
             return None
         if tpl.shape[0] > adb_img.shape[0] or tpl.shape[1] > adb_img.shape[1]:
             return -1.0  # template ใหญ่กว่าหน้าจอ = ความละเอียดไม่ตรงแน่นอน
-        return float(cv2.matchTemplate(adb_img, tpl, cv2.TM_CCOEFF_NORMED).max())
+        gray = cv2.cvtColor(adb_img, cv2.COLOR_BGR2GRAY) if adb_img.ndim == 3 else adb_img
+        return float(cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED).max())
     except Exception:
         return None
 
@@ -82,6 +84,9 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Users\Administrator\Downloads\Cooki
 
 # ตำแหน่งข้อความ UID บนหน้าจอหลังกด coyp-id2 (x, y, กว้าง, สูง)
 UID_REGION = (392, 238, 209, 43)
+
+# ระยะเวลาระหว่างรอบสแกนรูปภาพ (วินาที) - Main() จะปรับตามจำนวนเครื่องที่เชื่อมต่อ
+GLOBAL_SEARCH_INTERVAL = 0.6
 
 
 # ตารางแปลงตัวอักษรที่ OCR ชอบอ่านสับสน กลับเป็นเลขฐาน 16 (UID เป็น hex ตัวพิมพ์เล็ก)
@@ -96,9 +101,7 @@ def read_uid_ocr(device):
     วิธี: แยกตัวอักษรสีเหลืองออกจากพื้นหลัง ตัดทีละตัว แล้ว OCR ทีละตัวอักษร
     (ทดสอบแล้วแม่นกว่าอ่านทั้งบรรทัด ซึ่งชอบตกเลข 1 ท้ายและอ่านเลข 0 เป็นตัว O)"""
     try:
-        cap = device.screencap()
-        image = np.frombuffer(cap, dtype=np.uint8)
-        screen = cv2.imdecode(image, cv2.IMREAD_COLOR)
+        screen = fast_screencap(device)
         x, y, w, h = UID_REGION
         crop = cv2.resize(screen[y:y + h, x:x + w], None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
 
@@ -142,9 +145,7 @@ def copy_uid_via_id3(device, max_find_attempts=15):
     copy_pos = None
     for _ in range(max_find_attempts):
         try:
-            cap = device.screencap()
-            image = np.frombuffer(cap, dtype=np.uint8)
-            screen = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            screen = fast_screencap(device)
             copy_pos = ImgSearchADB(screen, 'img/coyp-id3.bmp')
             if copy_pos:
                 break
@@ -632,7 +633,7 @@ def limit_cpu_usage():
         print(f"Error setting CPU priority: {e}")
 
 class ImageCache:
-    def __init__(self, max_size=50, cleanup_interval=300):
+    def __init__(self, max_size=200, cleanup_interval=600):
         self.cache = {}
         self.max_size = max_size
         self.last_cleanup = time.time()
@@ -650,7 +651,8 @@ class ImageCache:
         if path not in self.cache:
             if len(self.cache) >= self.max_size:
                 self.remove_least_used()
-            self.cache[path] = cv2.imread(path, cv2.IMREAD_COLOR)
+            # เก็บ template เป็นภาพขาวดำ - matchTemplate เร็วขึ้น ~3 เท่า (สำคัญมากตอนรันหลายเครื่อง)
+            self.cache[path] = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         return self.cache[path]
         
     def remove_least_used(self):
@@ -695,9 +697,7 @@ class ScreenCapture:
         # ถ้า cache เก่าเกินไปหรือยังไม่มี cache ให้ capture ใหม่
         if self.last_capture is None or age >= self.max_age or age >= self.min_interval:
             try:
-                cap = self.device.screencap()
-                image = np.frombuffer(cap, dtype=np.uint8)
-                self.last_capture = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                self.last_capture = fast_screencap(self.device)
                 self.last_capture_time = current_time
             except Exception as e:
                 print(f"Error capturing screen: {e}")
@@ -707,15 +707,85 @@ class ScreenCapture:
         return self.last_capture
 
 
+# แปลงภาพหน้าจอเป็นขาวดำครั้งเดียวต่อรอบ (thread-local: แต่ละเครื่องมีของตัวเอง ไม่ชนกัน)
+_gray_tls = threading.local()
+
+
+def _screen_to_gray(adb_img):
+    """cvtColor ภาพหน้าจอเป็นขาวดำ แล้ว cache ไว้ - ถ้าเป็นภาพเดิม (identity) ใช้ซ้ำไม่แปลงใหม่"""
+    if getattr(_gray_tls, "color", None) is adb_img and getattr(_gray_tls, "gray", None) is not None:
+        return _gray_tls.gray
+    gray = cv2.cvtColor(adb_img, cv2.COLOR_BGR2GRAY) if adb_img.ndim == 3 else adb_img
+    _gray_tls.color = adb_img
+    _gray_tls.gray = gray
+    return gray
+
+
+def fast_screencap(device):
+    """จับหน้าจอแบบ raw (ไม่ encode PNG) = เร็วกว่ามาก แล้วคืนภาพ BGR (แบบเดียวกับ login.py)
+    ถ้า raw ใช้ไม่ได้ fallback ไป PNG/ppadb ให้เอง"""
+    try:
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(
+            [ADB, "-s", device.serial, "exec-out", "screencap"],
+            capture_output=True, timeout=10, **kwargs
+        )
+        data = result.stdout
+        if result.returncode == 0 and len(data) >= 16:
+            w, h, _ = struct.unpack("<III", data[:12])
+            if 0 < w <= 4096 and 0 < h <= 4096:
+                header = len(data) - w * h * 4
+                if header in (12, 16):
+                    rgba = np.frombuffer(data[header:header + w * h * 4], np.uint8).reshape((h, w, 4))
+                    return np.ascontiguousarray(rgba[:, :, [2, 1, 0]])  # RGBA -> BGR
+            # เผื่อบาง emulator ส่ง PNG มา
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+            if img is not None:
+                return img
+    except Exception as e:
+        print(f"fast_screencap error {device.serial}: {e}")
+    # ทางสำรองสุดท้าย: ppadb screencap (PNG)
+    try:
+        cap = device.screencap()
+        return cv2.imdecode(np.frombuffer(cap, np.uint8), cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+
+
+# จำตำแหน่งที่เคยเจอรูปแต่ละอัน (UI เกมอยู่ตำแหน่งเดิมเสมอ) - รอบต่อไปเช็คบริเวณเล็กๆ ก่อน = เร็วขึ้นมาก
+_pos_memory = {}
+
+
 def ImgSearchADB(adb_img, find_img_path, threshold=0.95, method=cv2.TM_CCOEFF_NORMED):
     try:
-        find_img = image_cache.get_image(find_img_path)  # ใช้ cache แทน
+        find_img = image_cache.get_image(find_img_path)  # ใช้ cache แทน (เป็นภาพขาวดำแล้ว)
         if find_img is None:
             return None
-            
-        needle_w = find_img.shape[1]
-        needle_h = find_img.shape[0]
-        result = cv2.matchTemplate(adb_img, find_img, method)
+
+        gray_screen = _screen_to_gray(adb_img)
+        needle_h, needle_w = find_img.shape[:2]
+        H, W = gray_screen.shape[:2]
+
+        # เช็คบริเวณที่จำไว้ก่อน (ROI เล็กๆ รอบตำแหน่งเดิม) - ถ้าเจอ ไม่ต้องสแกนเต็มจอ
+        remembered = _pos_memory.get(find_img_path)
+        if remembered is not None:
+            rx, ry = remembered
+            pad = 6
+            x0 = max(0, rx - pad); y0 = max(0, ry - pad)
+            x1 = min(W, rx + needle_w + pad); y1 = min(H, ry + needle_h + pad)
+            roi = gray_screen[y0:y1, x0:x1]
+            if roi.shape[0] >= needle_h and roi.shape[1] >= needle_w:
+                _, maxv, _, maxloc = cv2.minMaxLoc(cv2.matchTemplate(roi, find_img, method))
+                if maxv >= threshold:
+                    return [(x0 + maxloc[0] + needle_w // 2, y0 + maxloc[1] + needle_h // 2)]
+
+        result = cv2.matchTemplate(gray_screen, find_img, method)
+        # จำตำแหน่งที่ดีที่สุด (top-left) ไว้ใช้รอบหน้า
+        _, best_v, _, best_loc = cv2.minMaxLoc(result)
+        if best_v >= threshold:
+            _pos_memory[find_img_path] = (best_loc[0], best_loc[1])
         locations = np.where(result >= threshold)
         locations = list(zip(*locations[::-1]))
         rectangles = []
@@ -751,9 +821,7 @@ def perform_sing_actions(device):
             for attempt in range(max_attempts):
                 try:
                     print(f"Device {device.serial}: กำลังตรวจสอบ ok.png ({message}) ครั้งที่ {attempt + 1}/{max_attempts}")
-                    cap = device.screencap()
-                    image = np.frombuffer(cap, dtype=np.uint8)
-                    adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                    adb_img = fast_screencap(device)
                     pos_ok = ImgSearchADB(adb_img, 'img/ok.png')
                     if pos_ok:
                         print(f"Device {device.serial}: พบ ok.png {message}")
@@ -773,9 +841,7 @@ def perform_sing_actions(device):
         while retry_count < max_retries:
             try:
                 print(f"Device {device.serial}: กำลังค้นหา guestlogin.png (พยายามครั้งที่ {retry_count + 1}/{max_retries})")
-                cap = device.screencap()
-                image = np.frombuffer(cap, dtype=np.uint8)
-                adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                adb_img = fast_screencap(device)
 
                 # ใช้ threshold 0.9 (ปุ่ม Guest Login เด่นมาก) เผื่อเครื่องอื่นเรนเดอร์ต่างกันเล็กน้อย
                 pos_guest = ImgSearchADB(adb_img, 'img/guestloing.png', threshold=0.9)
@@ -786,9 +852,7 @@ def perform_sing_actions(device):
                     check_and_click_ok(device, "หลังกด Guest Login")
 
                     # ถ่ายภาพหน้าจอใหม่เพื่อค้นหา login.png
-                    cap = device.screencap()
-                    image = np.frombuffer(cap, dtype=np.uint8)
-                    adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                    adb_img = fast_screencap(device)
 
                 # ค้นหา login.png จากภาพล่าสุด
                 print(f"Device {device.serial}: กำลังค้นหา login.png...")
@@ -803,9 +867,7 @@ def perform_sing_actions(device):
                     while True:
                         checkpoint_attempt += 1
                         print(f"Device {device.serial}: กำลังรอ checkpoint-click (ครั้งที่ {checkpoint_attempt})")
-                        cap = device.screencap()
-                        image = np.frombuffer(cap, dtype=np.uint8)
-                        adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                        adb_img = fast_screencap(device)
                         pos_checkpoint = ImgSearchADB(adb_img, 'img/checkpoint-click.bmp')
                         if pos_checkpoint:
                             print(f"\nDevice {device.serial}: === พบ checkpoint-click กดเลย ===")
@@ -958,7 +1020,7 @@ def device_worker(device):
             limit_cpu_usage()
             
             # ค่าคงที่สำหรับการตั้งค่าเวลา
-            SEARCH_INTERVAL = 0.5  # ระยะห่างระหว่างการค้นหารูปภาพ
+            SEARCH_INTERVAL = GLOBAL_SEARCH_INTERVAL  # ระยะห่างระหว่างการค้นหารูปภาพ (ปรับตามจำนวนเครื่อง)
             CLICK_DELAY = 0     # ดีเลย์หลังการคลิก
             BOX3_WAIT = 5         # เวลารอหลังคลิก box3
             CLEAR_APP_WAIT = 5   # เวลารอหลังการ Clear App
@@ -1032,9 +1094,7 @@ def device_worker(device):
             while True:
                 try:
                     # ถ่ายภาพหน้าจอสำหรับตรวจจับรูปภาพ (ประมวลผลทันที ไม่รอให้ภาพเก่า)
-                    cap = device.screencap()
-                    image = np.frombuffer(cap, dtype=np.uint8)
-                    adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                    adb_img = fast_screencap(device)
                     found_any_image = False
 
 
@@ -1107,9 +1167,7 @@ def device_worker(device):
 
                         while True:
                             try:
-                                cap = device.screencap()
-                                image = np.frombuffer(cap, dtype=np.uint8)
-                                current_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                current_img = fast_screencap(device)
                                 pos = ImgSearchADB(current_img, 'img/event.png')
                                 
                                 if pos:
@@ -1140,9 +1198,7 @@ def device_worker(device):
                                             device.shell("input keyevent KEYCODE_BACK")
 
                                             try:
-                                                cap = device.screencap()
-                                                image = np.frombuffer(cap, dtype=np.uint8)
-                                                check_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                                check_img = fast_screencap(device)
 
                                                 # เจอ mainstage.png = ถึงหน้าหลักแล้ว หยุดกด BACK แล้วไปเริ่ม 7day
                                                 pos_mainstage_check = ImgSearchADB(check_img, mainstage_path)
@@ -1195,9 +1251,7 @@ def device_worker(device):
                         for seq_img in sequence_images:
                             while True:
                                 try:
-                                    cap = device.screencap()
-                                    image = np.frombuffer(cap, dtype=np.uint8)
-                                    current_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                    current_img = fast_screencap(device)
                                     pos = ImgSearchADB(current_img, seq_img)
                                     
                                     if pos:
@@ -1220,9 +1274,7 @@ def device_worker(device):
                                                 print(f"Device {device.serial}: กด ESC ครั้งที่ {esc_count}")
                                                 device.shell("input keyevent KEYCODE_BACK")
                                                 try:
-                                                    cap = device.screencap()
-                                                    image = np.frombuffer(cap, dtype=np.uint8)
-                                                    check_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                                    check_img = fast_screencap(device)
                                                     cancel_pos = ImgSearchADB(check_img, 'img/cancel.png')
                                                     if cancel_pos:
                                                         print(f"Device {device.serial}: พบ cancel.png หลังกด ESC {esc_count} ครั้ง หยุดกด")
@@ -1239,9 +1291,7 @@ def device_worker(device):
                                                 copy_found = False
                                                 for copy_attempt in range(30):  # รอรูปละไม่เกิน 30 รอบ
                                                     try:
-                                                        cap = device.screencap()
-                                                        image = np.frombuffer(cap, dtype=np.uint8)
-                                                        copy_screen = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                                        copy_screen = fast_screencap(device)
                                                         copy_pos = ImgSearchADB(copy_screen, copy_img)
                                                         if copy_pos:
                                                             print(f"Device {device.serial}: พบ {copy_img} กดเลย")
@@ -1285,9 +1335,7 @@ def device_worker(device):
                                             cancel_hunt_start = time.time()
                                             while time.time() - cancel_hunt_start < 8:
                                                 try:
-                                                    cap = device.screencap()
-                                                    image = np.frombuffer(cap, dtype=np.uint8)
-                                                    hunt_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                                    hunt_img = fast_screencap(device)
                                                     hunt_cancel = ImgSearchADB(hunt_img, 'img/cancel.png')
                                                     if hunt_cancel:
                                                         print(f"Device {device.serial}: พบ cancel.png กดปิดก่อน")
@@ -1300,9 +1348,7 @@ def device_worker(device):
                                             # ถ่ายจอใหม่แล้วค่อยกด 7day (ตำแหน่งอาจเปลี่ยนหลังปิด popup)
                                             print(f"Device {device.serial}: ครบ 8 วินาที กด 7day.png")
                                             try:
-                                                cap = device.screencap()
-                                                image = np.frombuffer(cap, dtype=np.uint8)
-                                                fresh_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                                fresh_img = fast_screencap(device)
                                                 new_pos = ImgSearchADB(fresh_img, 'img/7day.png')
                                             except Exception:
                                                 new_pos = None
@@ -1367,9 +1413,7 @@ def device_worker(device):
                         max_back_press = 50
                         while back_press_count < max_back_press:
                             try:
-                                cap = device.screencap()
-                                image = np.frombuffer(cap, dtype=np.uint8)
-                                check_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                                check_img = fast_screencap(device)
                                 pos_cancel = ImgSearchADB(check_img, 'img/cancel.png')
                                 
                                 if pos_cancel:
@@ -1536,9 +1580,7 @@ def press_back_until_cancel(device):
     while back_count < max_attempts:
         try:
             # ถ่ายภาพหน้าจอ
-            cap = device.screencap()
-            image = np.frombuffer(cap, dtype=np.uint8)
-            current_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            current_img = fast_screencap(device)
             
             # ตรวจสอบ cancel.png
             cancel_pos = ImgSearchADB(current_img, 'img/cancel.png')
@@ -1599,9 +1641,7 @@ def monitor_screen_color(device):
             current_time = time.time()
             if current_time - last_check_time >= CHECK_INTERVAL:
                 # ถ่ายภาพหน้าจอ
-                cap = device.screencap()
-                image = np.frombuffer(cap, dtype=np.uint8)
-                adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                adb_img = fast_screencap(device)
                 
                 # ตรวจสอบสี
                 screen_percentage, is_gray_screen = check_screen_color(adb_img)
@@ -1615,11 +1655,15 @@ def monitor_screen_color(device):
             time.sleep(1)
 
 def limit_cpu_usage():
-    # ตั้งค่า nice value เพื่อลดความสำคัญของ process
+    """ลด priority ของ process บอท ให้ OS/emulator ได้ CPU ก่อน (เครื่องไม่ค้าง)"""
     try:
-        os.nice(10)  # ค่าสูงหมายถึงความสำคัญน้อยลง
-    except:
-        pass
+        p = psutil.Process()
+        if os.name == "nt":  # Windows
+            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        else:
+            os.nice(10)
+    except Exception as e:
+        print(f"ตั้ง CPU priority ไม่ได้: {e}")
 
 def Main():
     limit_cpu_usage()
@@ -1635,9 +1679,14 @@ def Main():
                 if isinstance(devices, list):
                     # คำนวณจำนวน workers ที่เหมาะสม
                     cpu_count = os.cpu_count() or 1
-                    max_workers = min(len(devices), cpu_count - 1 or 1)
-                    
-                    print(f"\nพบ {len(devices)} อุปกรณ์ ใช้ {max_workers} workers")
+                    # ต้องมี 1 worker ต่อ 1 เครื่องเสมอ (device_worker วนไม่รู้จบ ถ้า worker น้อยกว่าเครื่อง บางเครื่องจะไม่ถูกทำงานเลย)
+                    max_workers = len(devices)
+
+                    # เครื่องสเปคแรง CPU เหลือเยอะ - สแกนถี่เพื่อความไว (ไม่ต้อง throttle ตามจำนวนเครื่อง)
+                    global GLOBAL_SEARCH_INTERVAL
+                    GLOBAL_SEARCH_INTERVAL = 0.3
+
+                    print(f"\nพบ {len(devices)} อุปกรณ์ ใช้ {max_workers} workers | ระยะสแกน {GLOBAL_SEARCH_INTERVAL:.1f}s/รอบ")
                     
                     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                         futures = [executor.submit(device_worker, device) 
