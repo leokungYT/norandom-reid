@@ -1,51 +1,18 @@
 @echo off
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
-:: =========================================================
-:: Auto Update Script for norandom-reid Bot (in-place update)
-:: =========================================================
-:: URL: https://github.com/leokungYT/norandom-reid
-:: =========================================================
-
-:: --- Two-stage run so the update can overwrite this .bat safely ---
-:: Parent (no GO flag): remember target folder in a marker file, copy self
-:: to TEMP, relaunch the copy with a simple GO flag (no path arg = no cmd
-:: quote/backslash bug), then exit. Child (GO flag) reads the marker.
-if not "%~1"=="GO" (
-    > "%TEMP%\norandom_target.txt" echo %~dp0
-    copy /y "%~f0" "%TEMP%\norandom_autoupdate.bat" >nul
-    start "norandom-reid Auto Update" "%TEMP%\norandom_autoupdate.bat" GO
-    exit
-)
-
-:: --- Child: read target folder from the marker file ---
-set "TARGET_FOLDER="
-set /p TARGET_FOLDER=<"%TEMP%\norandom_target.txt"
-if not defined TARGET_FOLDER (
-    echo [ERROR] Could not read target folder marker. Run this .bat again from the bot folder.
-    pause
-    exit /b 1
-)
-if "%TARGET_FOLDER:~-1%"=="\" set "TARGET_FOLDER=%TARGET_FOLDER:~0,-1%"
-if not exist "%TARGET_FOLDER%" (
-    echo [ERROR] Target folder not found: %TARGET_FOLDER%
-    pause
-    exit /b 1
-)
-cd /d "%TARGET_FOLDER%"
-
-echo.
 echo ============================================
 echo      Auto Update: norandom-reid Bot
 echo ============================================
-echo Target: %TARGET_FOLDER%
+echo Folder: %CD%
 echo.
 
 :: Kill ADB and Python processes to prevent file locks
 echo [PRE] Stopping ADB and Bot processes...
 taskkill /f /im adb.exe >nul 2>&1
 taskkill /f /im python.exe >nul 2>&1
-timeout /t 2 /nobreak >nul
+ping -n 3 127.0.0.1 >nul
 
 set "REPO_URL=https://github.com/leokungYT/norandom-reid/archive/refs/heads/main.zip"
 set "ZIP_NAME=norandom_update.zip"
@@ -53,10 +20,8 @@ set "EXTRACT_DIR=update_temp"
 
 :: 1. Download the latest version (retry up to 3 times with curl, then fallback to PowerShell)
 echo [1/5] Downloading latest version from GitHub...
-
 set "DOWNLOAD_OK=0"
 
-:: Try curl with retries
 for /L %%i in (1,1,3) do (
     if !DOWNLOAD_OK! EQU 0 (
         echo [CURL] Attempt %%i/3...
@@ -68,12 +33,11 @@ for /L %%i in (1,1,3) do (
             )
         ) else (
             echo [CURL] Attempt %%i failed, retrying...
-            timeout /t 3 /nobreak >nul
+            ping -n 4 127.0.0.1 >nul
         )
     )
 )
 
-:: Fallback to PowerShell if curl failed
 if !DOWNLOAD_OK! EQU 0 (
     echo [CURL] All attempts failed. Trying PowerShell fallback...
     powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { Invoke-WebRequest -Uri '%REPO_URL%' -OutFile '%ZIP_NAME%' -UseBasicParsing -TimeoutSec 60; exit 0 } catch { Write-Host $_.Exception.Message; exit 1 }"
@@ -98,7 +62,6 @@ echo [2/5] Extracting files...
 if exist "%EXTRACT_DIR%" rd /s /q "%EXTRACT_DIR%"
 powershell -Command "Expand-Archive -Path '%ZIP_NAME%' -DestinationPath '%EXTRACT_DIR%' -Force"
 
-:: Identify the source directory (GitHub zips name folders like 'norandom-reid-main')
 set "SOURCE_FOLDER="
 for /d %%f in ("%EXTRACT_DIR%\*") do set "SOURCE_FOLDER=%%f"
 
@@ -114,35 +77,43 @@ if not defined SOURCE_FOLDER (
 echo [3/5] Cleaning old img folder (if needed)...
 if exist "img" rd /s /q "img"
 
-:: 4. Secure local backups + Copy new files from extracted zip
-echo [4/5] Copying new files to %TARGET_FOLDER%\...
+:: 4. Copy new files (exclude THIS running .bat so it is never overwritten mid-run)
+echo [4/5] Copying new files...
 echo ============================================
-:: ลบโฟลเดอร์ backup/ผลเทสจากไฟล์ที่โหลดมาก่อน กันเขียนทับของเครื่องนี้
 if exist "%SOURCE_FOLDER%\backup" rd /s /q "%SOURCE_FOLDER%\backup"
 if exist "%SOURCE_FOLDER%\backup-id" rd /s /q "%SOURCE_FOLDER%\backup-id"
 if exist "%SOURCE_FOLDER%\test-ocr-output" rd /s /q "%SOURCE_FOLDER%\test-ocr-output"
 
-xcopy /s /e /y "%SOURCE_FOLDER%\*" "%TARGET_FOLDER%\"
+> "_nr_exclude.txt" echo autoupdate.bat
+xcopy /s /e /y /EXCLUDE:_nr_exclude.txt "%SOURCE_FOLDER%\*" ".\"
+del /q "_nr_exclude.txt" >nul 2>&1
+
+:: If the repo shipped a newer autoupdate.bat, stage it (avoid overwriting the running one)
+if exist "%SOURCE_FOLDER%\autoupdate.bat" (
+    fc /b "%SOURCE_FOLDER%\autoupdate.bat" "autoupdate.bat" >nul 2>&1
+    if errorlevel 1 (
+        copy /y "%SOURCE_FOLDER%\autoupdate.bat" "autoupdate_new.bat" >nul
+        echo [NOTE] autoupdate.bat changed - saved as autoupdate_new.bat ^(replace it before next update^)
+    )
+)
 echo ============================================
 
 :: 5. Cleanup
 echo [5/5] Cleaning up temporary files...
-del /q "%ZIP_NAME%"
-:: retry a few times - Windows Defender may still hold freshly extracted files
+del /q "%ZIP_NAME%" >nul 2>&1
 for /L %%i in (1,1,5) do (
     if exist "%EXTRACT_DIR%" (
         rd /s /q "%EXTRACT_DIR%" >nul 2>&1
-        if exist "%EXTRACT_DIR%" timeout /t 2 /nobreak >nul
+        if exist "%EXTRACT_DIR%" ping -n 3 127.0.0.1 >nul
     )
 )
 
-:: Make sure required Python packages are installed (bot needs OCR etc.)
 echo [PIP] Checking required Python packages...
 py -m pip install --quiet pure-python-adb opencv-python numpy psutil pytesseract pyperclip >nul 2>&1
 
 echo.
 echo ============================================
-echo      Update Successful (Saved in %TARGET_FOLDER%)
+echo      Update Successful!  (Folder: %CD%)
 echo ============================================
 echo.
 pause
