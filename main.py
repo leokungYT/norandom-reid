@@ -805,7 +805,7 @@ def _screen_to_gray(adb_img):
 
 
 # === Watchdog: ถ้าเครื่องไหนค้าง/ไม่คืบหน้าเกิน 25 นาที ให้ล้างแอพเริ่มใหม่ตั้งแต่ลบไฟล์ ===
-STUCK_TIMEOUT = 1500  # 25 นาที (วินาที)
+STUCK_TIMEOUT = 900  # ค้างเกิน 900 วินาที (15 นาที) ให้เริ่มใหม่ตั้งแต่ลบไฟล์
 _last_activity = {}   # serial -> เวลาที่คืบหน้าล่าสุด
 
 
@@ -1198,7 +1198,7 @@ def device_worker(device):
 
             # ตัวแปรสำหรับการติดตามสถานะ
             last_image_found_time = time.time()
-            no_image_timeout = 1500  # ไม่พบรูปภาพเกิน 1500 วินาที (25 นาที) ค่อยเริ่มใหม่ตั้งแต่ลบไฟล์
+            no_image_timeout = 500  # ไม่พบรูปภาพเกิน 500 วินาที (~8 นาที) ค่อยเริ่มใหม่ตั้งแต่ลบไฟล์
             mainstage_attempts = 0
             max_mainstage_attempts = 10
                                 # เพิ่มตัวแปรด้านบนของฟังก์ชัน device_worker
