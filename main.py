@@ -1885,34 +1885,21 @@ def run_with_gui():
     ctk.set_appearance_mode("dark")
     root = ctk.CTk()
     root.title("norandom-reid Bot")
-    root.geometry("560x640")
+    root.geometry("360x180")
 
-    header = ctk.CTkFrame(root, fg_color="transparent")
-    header.pack(fill="x", padx=12, pady=(12, 6))
-    ctk.CTkLabel(header, text="🤖 norandom-reid Bot", font=ctk.CTkFont(size=16, weight="bold")).pack(side="left")
-    lbl_backup = ctk.CTkLabel(header, text="✅ Backup: 0", font=ctk.CTkFont(size=15, weight="bold"), text_color="#4caf50")
-    lbl_backup.pack(side="right")
-
-    lbl_count = ctk.CTkLabel(root, text="เครื่องที่เชื่อมต่อ: 0", font=ctk.CTkFont(size=12), anchor="w")
-    lbl_count.pack(fill="x", padx=14)
-
-    frame = ctk.CTkScrollableFrame(root, label_text="สถานะแต่ละเครื่อง")
-    frame.pack(fill="both", expand=True, padx=12, pady=8)
-    rows = {}  # serial -> label
+    ctk.CTkLabel(root, text="🤖 norandom-reid Bot",
+                 font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(20, 10))
+    lbl_backup = ctk.CTkLabel(root, text="✅ Backup: 0",
+                              font=ctk.CTkFont(size=26, weight="bold"), text_color="#4caf50")
+    lbl_backup.pack(pady=6)
+    lbl_count = ctk.CTkLabel(root, text="เครื่องที่เชื่อมต่อ: 0", font=ctk.CTkFont(size=13))
+    lbl_count.pack(pady=4)
 
     def refresh():
+        # เบามาก - อัปเดตแค่ 2 ตัวเลข ทุก 2 วิ (ไม่แสดงรายการ 16 เครื่องแล้ว กัน GUI ค้าง)
         lbl_backup.configure(text=f"✅ Backup: {_count_backups()}")
-        serials = sorted(device_status.keys())
-        lbl_count.configure(text=f"เครื่องที่เชื่อมต่อ: {len(serials)}")
-        for serial in serials:
-            if serial not in rows:
-                lb = ctk.CTkLabel(frame, text="", anchor="w", justify="left",
-                                  font=ctk.CTkFont(family="Consolas", size=11))
-                lb.pack(fill="x", padx=6, pady=2)
-                rows[serial] = lb
-            line = device_status.get(serial, "")
-            rows[serial].configure(text=f"[{serial}]  {line[:70]}")
-        root.after(1000, refresh)
+        lbl_count.configure(text=f"เครื่องที่เชื่อมต่อ: {len(device_status)}")
+        root.after(2000, refresh)
 
     threading.Thread(target=Main, daemon=True).start()
     refresh()
