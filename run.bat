@@ -55,4 +55,8 @@ if exist "!WARP_CLI!" (
 echo.
 echo [BOT] เริ่มรันบอท...
 adb disconnect 127.0.0.1:16494 >nul 2>&1
+
+echo [PIP] Installing/checking Python packages the bot needs...
+py -m pip install --quiet --disable-pip-version-check pure-python-adb opencv-python numpy psutil pytesseract pyperclip customtkinter
+
 py main.py
