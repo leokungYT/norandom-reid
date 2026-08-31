@@ -109,7 +109,7 @@ for /L %%i in (1,1,5) do (
 )
 
 echo [PIP] Checking required Python packages...
-py -m pip install --quiet pure-python-adb opencv-python numpy psutil pytesseract pyperclip >nul 2>&1
+py -m pip install --quiet pure-python-adb opencv-python numpy psutil pytesseract pyperclip customtkinter >nul 2>&1
 
 echo.
 echo ============================================

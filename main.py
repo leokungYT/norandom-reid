@@ -219,6 +219,57 @@ def copy_uid_via_id3(device, max_find_attempts=15):
     print(f"Device {device.serial}: อ่าน UID จาก clipboard ไม่สำเร็จ")
     return None
 
+# สถานะล่าสุดต่อ device (ให้ GUI อ่านไปแสดง) - serial -> ข้อความ log ล่าสุด
+device_status = {}
+
+
+class PerDeviceLog:
+    """ดัก print ทั้งหมด แล้วแยกเขียน log ต่อ device ลงไฟล์ logs/<serial>.log
+    (ตาม thread ของ device_worker) พร้อมยังโชว์ใน console เหมือนเดิม - ไม่ต้องแก้ print ที่มีอยู่"""
+    def __init__(self, real_stdout):
+        self.real = real_stdout
+        self.files = {}          # thread ident -> ไฟล์ log ของ device นั้น
+        self.thread_serial = {}  # thread ident -> serial (ไว้ให้ GUI แสดงสถานะ)
+        self.lock = threading.Lock()
+
+    def register(self, serial):
+        """ให้ thread ปัจจุบัน (device_worker) เขียน log ลงไฟล์ของ device นี้"""
+        try:
+            os.makedirs("logs", exist_ok=True)
+            safe = str(serial).replace(":", "_")
+            f = open(os.path.join("logs", f"{safe}.log"), "a", encoding="utf-8", buffering=1)
+            with self.lock:
+                old = self.files.get(threading.get_ident())
+                if old is not None:
+                    try: old.close()
+                    except Exception: pass
+                self.files[threading.get_ident()] = f
+                self.thread_serial[threading.get_ident()] = str(serial)
+        except Exception as e:
+            self.real.write(f"[PerDeviceLog] เปิดไฟล์ log ไม่ได้: {e}\n")
+
+    def write(self, text):
+        self.real.write(text)                       # โชว์ใน console เสมอ
+        ident = threading.get_ident()
+        f = self.files.get(ident)                   # + เขียนลงไฟล์ของ device นั้น (ถ้ามี)
+        if f is not None:
+            try:
+                f.write(text)
+            except Exception:
+                pass
+        serial = self.thread_serial.get(ident)      # + เก็บบรรทัดล่าสุดไว้ให้ GUI
+        if serial is not None:
+            line = text.strip()
+            if line:
+                device_status[serial] = line
+
+    def flush(self):
+        try:
+            self.real.flush()
+        except Exception:
+            pass
+
+
 def find_mumu_adb_ports():
     """ค้นหา port ของ MuMu ADB ที่ active อยู่"""
     try:
@@ -1110,6 +1161,8 @@ def reset_app_and_login(device, clear_app_wait=5):
 
 def device_worker(device):
     """Worker function for handling device automation"""
+    if isinstance(sys.stdout, PerDeviceLog):
+        sys.stdout.register(device.serial)  # แยก log ของ device นี้ลงไฟล์ logs/<serial>.log
     mark_activity(device)  # arm watchdog 25 นาที ตั้งแต่วินาทีแรกที่บอทเริ่มทำงาน
     last_memory_cleanup = time.time()
     last_image_cleanup = time.time()
@@ -1811,6 +1864,62 @@ def Main():
             print(f"เกิดข้อผิดพลาดในการทำงาน: {e}")
             time.sleep(5)
 
+def _count_backups():
+    """นับจำนวนไฟล์ backup ที่ได้ (.xml ทั้งแบบ botick-id และ noradom+[uid])"""
+    try:
+        return len(glob.glob(os.path.join("backup", "*.xml")))
+    except Exception:
+        return 0
+
+
+def run_with_gui():
+    """เปิด GUI แสดงจำนวน backup + สถานะต่อ device แล้วรันบอทเป็น thread เบื้องหลัง
+    ถ้าไม่มี customtkinter ก็รันแบบ console อย่างเดียว"""
+    try:
+        import customtkinter as ctk
+    except Exception:
+        print("ไม่พบ customtkinter - รันแบบ console อย่างเดียว")
+        Main()
+        return
+
+    ctk.set_appearance_mode("dark")
+    root = ctk.CTk()
+    root.title("norandom-reid Bot")
+    root.geometry("560x640")
+
+    header = ctk.CTkFrame(root, fg_color="transparent")
+    header.pack(fill="x", padx=12, pady=(12, 6))
+    ctk.CTkLabel(header, text="🤖 norandom-reid Bot", font=ctk.CTkFont(size=16, weight="bold")).pack(side="left")
+    lbl_backup = ctk.CTkLabel(header, text="✅ Backup: 0", font=ctk.CTkFont(size=15, weight="bold"), text_color="#4caf50")
+    lbl_backup.pack(side="right")
+
+    lbl_count = ctk.CTkLabel(root, text="เครื่องที่เชื่อมต่อ: 0", font=ctk.CTkFont(size=12), anchor="w")
+    lbl_count.pack(fill="x", padx=14)
+
+    frame = ctk.CTkScrollableFrame(root, label_text="สถานะแต่ละเครื่อง")
+    frame.pack(fill="both", expand=True, padx=12, pady=8)
+    rows = {}  # serial -> label
+
+    def refresh():
+        lbl_backup.configure(text=f"✅ Backup: {_count_backups()}")
+        serials = sorted(device_status.keys())
+        lbl_count.configure(text=f"เครื่องที่เชื่อมต่อ: {len(serials)}")
+        for serial in serials:
+            if serial not in rows:
+                lb = ctk.CTkLabel(frame, text="", anchor="w", justify="left",
+                                  font=ctk.CTkFont(family="Consolas", size=11))
+                lb.pack(fill="x", padx=6, pady=2)
+                rows[serial] = lb
+            line = device_status.get(serial, "")
+            rows[serial].configure(text=f"[{serial}]  {line[:70]}")
+        root.after(1000, refresh)
+
+    threading.Thread(target=Main, daemon=True).start()
+    refresh()
+    root.mainloop()
+
+
 if __name__ == "__main__":
-    Main()
+    sys.stdout = PerDeviceLog(sys.stdout)  # เปิดการแยก log ต่อ device
+    run_with_gui()
 
