@@ -929,26 +929,11 @@ def ImgSearchADB(adb_img, find_img_path, threshold=0.95, method=cv2.TM_CCOEFF_NO
                     return [(x0 + maxloc[0] + needle_w // 2, y0 + maxloc[1] + needle_h // 2)]
 
         result = cv2.matchTemplate(gray_screen, find_img, method)
-        # จำตำแหน่งที่ดีที่สุด (top-left) ไว้ใช้รอบหน้า
+        # ใช้ minMaxLoc เอา match ที่ดีที่สุดจุดเดียว (ไม่ใช้ groupRectangles - บาง build ของ opencv ไม่มี)
         _, best_v, _, best_loc = cv2.minMaxLoc(result)
         if best_v >= threshold:
-            _pos_memory[find_img_path] = (best_loc[0], best_loc[1])
-        locations = np.where(result >= threshold)
-        locations = list(zip(*locations[::-1]))
-        rectangles = []
-        for loc in locations:
-            rect = [int(loc[0]), int(loc[1]), needle_w, needle_h]
-            rectangles.append(rect)
-            rectangles.append(rect)
-        rectangles, _ = cv2.groupRectangles(rectangles, groupThreshold=1, eps=1)
-        points = []
-        if len(rectangles):
-            for (x, y, w, h) in rectangles:
-                center_x = x + int(w/2)
-                center_y = y + int(h/2)
-                points.append((center_x, center_y))
-        if len(points) > 0:
-            return points
+            _pos_memory[find_img_path] = (best_loc[0], best_loc[1])  # จำตำแหน่งไว้ใช้รอบหน้า
+            return [(best_loc[0] + needle_w // 2, best_loc[1] + needle_h // 2)]
         return None
     except Exception as e:
         print(f"Error in ImgSearchADB for {find_img_path}: {e}")
