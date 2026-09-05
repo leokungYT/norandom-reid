@@ -1252,6 +1252,7 @@ def device_worker(device):
             check_fixback = False
             tried_mainstage = False
             clearstage4_count = 0  # นับ STOP ในรอบบัญชีนี้ - รีเซ็ตทุกครั้งที่เริ่มบัญชีใหม่
+            in_7day_phase = False  # True = เข้าเกมช่วง 7day แล้ว ให้เช็คแค่ event กับ 7day
 
             # รายการรูปภาพที่ต้องตรวจสอบ
             mainstage_path = 'img/mainstage.png'
@@ -1260,6 +1261,10 @@ def device_worker(device):
                 'img/event.png', 'img/box1.png',
                 'img/box2.png', 'img/box3.png', 'img/ok.png', 'img/event.png'
             ]
+
+            # ช่วง 7day (หลัง STOP ครั้งที่ 2) เข้าเกมแล้ว - สแกนแค่ 7day พอ
+            # (event.png มีการเช็คแยกอยู่ก่อนหน้าลูปนี้อยู่แล้ว ไม่ต้องใส่ซ้ำ)
+            SEVENDAY_ONLY_IMAGES = ['img/7day.png', 'img/7day1.png', 'img/7day2.png']
 
             image_list = [
                 'img/fixid.png',  # เพิ่มการตรวจสอบ fixid
@@ -1372,6 +1377,7 @@ def device_worker(device):
 
                         # ถึงตรงนี้ = stage2 จบแล้ว และเพิ่งเปิดแอพรอบที่ 3 -> เริ่มงาน 7day ตามปกติ
                         print(f"Device {device.serial}: stage2 จบแล้ว -> เริ่มงาน 7day")
+                        in_7day_phase = True  # ตั้งแต่นี้เช็คแค่ event กับ 7day ไม่สแกน gacha/gototeam ฯลฯ
 
                         # เริ่มค้นหา event.png
                         print(f"Device {device.serial}: เริ่มค้นหา event.png...")
@@ -1541,6 +1547,8 @@ def device_worker(device):
                                                 last_image_found_time = time.time()
                                                 tried_mainstage = False
                                                 mainstage_attempts = 0
+                                                clearstage4_count = 0  # บัญชีใหม่ - เริ่มนับ STOP ใหม่
+                                                in_7day_phase = False  # กลับไปสแกน image_list เต็ม
                                                 break  # ออกจากลูป sequence_images
                                         
                                         elif seq_img == 'img/7day.png':
@@ -1645,7 +1653,9 @@ def device_worker(device):
                                 break
 
                     # ตรวจสอบรูปภาพอื่นๆ
-                    for img_path in image_list:
+                    # เข้าเกมช่วง 7day แล้ว = เช็คแค่ 7day (event เช็คไปข้างบนแล้ว)
+                    # ไม่งั้นจะไปเจอ gacha/gototeam สลับกันแล้วกดวนไปมาไม่จบ
+                    for img_path in (SEVENDAY_ONLY_IMAGES if in_7day_phase else image_list):
                         try:
                             pos = ImgSearchADB(adb_img, img_path)
                             if pos:
@@ -1681,6 +1691,8 @@ def device_worker(device):
                                     event_start_time = None
                                     event_found_continuously = False
                                     check_fixback = False
+                                    clearstage4_count = 0  # บัญชีใหม่ - เริ่มนับ STOP ใหม่
+                                    in_7day_phase = False  # กลับไปสแกน image_list เต็ม
                                     break
                                 
                                 elif 'steage2.png' in img_path:
