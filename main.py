@@ -852,7 +852,57 @@ def check_checkpoint_stuck(device, adb_img):
         _checkpoint_since[device.serial] = None  # ไม่เจอแล้ว - รีเซ็ตตัวจับเวลา
 
 
+# === เฝ้า fixnet.png แบบลอยๆ: อันดับแรกสุดเสมอ - เจอเมื่อไหร่กดทันที ทุกลูป ทุกฟังก์ชัน ===
+FIXNET_IMG = 'img/fixnet.png'
+FIXNET_THRESHOLD = 0.95        # เท่าค่า default เดิมที่ image_list ใช้ - ลดลงถ้าอยากให้จับง่ายขึ้น
+FIXNET_CLICK_COOLDOWN = 1.0    # กันกดรัวซ้ำป๊อปอัพเดิมก่อนมันทันหาย (วินาที)
+FIXNET_AFTER_CLICK_WAIT = 0.5  # รอป๊อปอัพหายแล้วค่อยจับภาพใหม่ (วินาที)
+_fixnet_last_click = {}        # serial -> เวลาที่กด fixnet ล่าสุด
+
+
+def check_fixnet(device, adb_img):
+    """หา fixnet.png แบบลอยๆ ทุกครั้งที่จับหน้าจอ - เจอเมื่อไหร่กดทันที
+    ป๊อปอัพเน็ตหลุดบังทุกอย่าง จึงต้องเคลียร์ก่อนงานอื่นเสมอ คืน True ถ้ากดไปแล้ว
+
+    หมายเหตุ: จงใจไม่เรียก mark_activity() ที่นี่ - ถ้าเน็ตหลุดวนไม่จบ
+    watchdog STUCK_TIMEOUT จะได้ยังทำงานและ reset เครื่องให้เอง"""
+    if adb_img is None:
+        return False
+    try:
+        pos = ImgSearchADB(adb_img, FIXNET_IMG, threshold=FIXNET_THRESHOLD)
+    except Exception:
+        return False
+    if not pos:
+        return False
+
+    now = time.time()
+    if now - _fixnet_last_click.get(device.serial, 0) < FIXNET_CLICK_COOLDOWN:
+        return False  # เพิ่งกดไป รอป๊อปอัพหายก่อน ไม่กดรัว
+
+    _fixnet_last_click[device.serial] = now
+    try:
+        device.shell(f"input tap {pos[0][0]} {pos[0][1]}")
+        print(f"Device {device.serial}: พบ fixnet.png -> กดทันที ({pos[0][0]}, {pos[0][1]})")
+        return True
+    except Exception as e:
+        print(f"Device {device.serial}: กด fixnet.png ไม่สำเร็จ: {e}")
+        return False
+
+
 def fast_screencap(device):
+    """จับหน้าจอ + เช็ค fixnet.png แบบลอยๆ ทุกครั้งก่อนคืนภาพ
+    ฟังก์ชันนี้ถูกเรียกจากทุกลูป/ทุกฟังก์ชัน การเช็คตรงนี้จึงครอบคลุมทั้งไฟล์
+    ถ้าเจอ fixnet จะกดให้ก่อน แล้วจับภาพใหม่คืนไป (ผู้เรียกจะได้ภาพที่ป๊อปอัพหายแล้ว)"""
+    adb_img = _screencap_raw(device)
+    if check_fixnet(device, adb_img):
+        time.sleep(FIXNET_AFTER_CLICK_WAIT)
+        fresh = _screencap_raw(device)
+        if fresh is not None:
+            return fresh
+    return adb_img
+
+
+def _screencap_raw(device):
     """จับหน้าจอแบบ raw (ไม่ encode PNG) = เร็วกว่ามาก แล้วคืนภาพ BGR (แบบเดียวกับ login.py)
     ถ้า raw ใช้ไม่ได้ fallback ไป PNG/ppadb ให้เอง"""
     check_stuck(device)  # จับเครื่องค้าง 25 นาที (ทำงานทุกเฟส เพราะ fast_screencap ถูกเรียกทุกที่)
@@ -877,7 +927,7 @@ def fast_screencap(device):
             if img is not None:
                 return img
     except Exception as e:
-        print(f"fast_screencap error {device.serial}: {e}")
+        print(f"_screencap_raw error {device.serial}: {e}")
     # ทางสำรองสุดท้าย: ppadb screencap (PNG)
     try:
         cap = device.screencap()
@@ -1218,7 +1268,7 @@ def device_worker(device):
                 'img/herodrag1.png', 'img/nextstage1-1.png', 'img/nextstage1.png', 
                 'img/stageok.png', 'img/start.png', 'img/heroo1.png', 
                 'img/heroo2.png', 'img/heroo3.png', 'img/heroo4.png', 'img/steage1.png', 
-                'img/okwhite.png', 'img/okgust.png', 'img/fixnet.png', 'img/saveteam.png',
+                'img/okwhite.png', 'img/okgust.png', 'img/saveteam.png',  # fixnet.png ย้ายไปเช็คแบบลอยๆ ใน fast_screencap แล้ว
                 'img/enter1.png', 'img/enter2.png', 'img/enter3.png', 'img/enter4.png',
                 'img/enter5.png', 'img/enter6.png', 'img/enter7.png', 'img/enter8.png',
                 'img/enter9.png', 'img/enter10.png', 'img/enter11.png', 'img/enter12.png',
