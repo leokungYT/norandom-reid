@@ -1217,6 +1217,10 @@ def device_worker(device):
             EVENT_WAIT = 15       # เวลารอสำหรับ event.png
             FIXBACK_WAIT = 5      # เวลารอสำหรับ fixback.png
             FIXBUG_WAIT = 30      # เวลารอสำหรับ fixbugicon
+            # เจอ clearstage4.png (STOP) กี่ครั้งถึงจะไปทำ 7day
+            # 1 = จบด่านแรก -> เปิดแอพรอบ 2 -> กลับไปเล่น stage2 ให้จบก่อน
+            # 2 = stage2 จบ  -> เปิดแอพรอบ 3 -> ค่อยทำ event/BACK/7day
+            STOP_ROUNDS_BEFORE_7DAY = 2
 
             print(f"\n=== เริ่มกระบวนการทำงาน ===")
             print(f"Device: {device.serial}")
@@ -1247,6 +1251,7 @@ def device_worker(device):
             event_found_continuously = False
             check_fixback = False
             tried_mainstage = False
+            clearstage4_count = 0  # นับ STOP ในรอบบัญชีนี้ - รีเซ็ตทุกครั้งที่เริ่มบัญชีใหม่
 
             # รายการรูปภาพที่ต้องตรวจสอบ
             mainstage_path = 'img/mainstage.png'
@@ -1335,7 +1340,8 @@ def device_worker(device):
                     if pos_clearstage4:
                         found_any_image = True
                         last_image_found_time = time.time()
-                        print(f"\nDevice {device.serial}: === พบ clearstage4.png ===")
+                        clearstage4_count += 1
+                        print(f"\nDevice {device.serial}: === พบ clearstage4.png (STOP ครั้งที่ {clearstage4_count}) ===")
                         
                         print(f"Device {device.serial}: [1/3] Clear App...")
                         device.shell("am force-stop com.linecorp.LGRGS")
@@ -1346,9 +1352,26 @@ def device_worker(device):
                             print(f"Device {device.serial}: เหลือเวลา {i} วินาที")
                             time.sleep(1)
                         
-                        print(f"Device {device.serial}: [3/3] เปิดแอพใหม่...")
+                        print(f"Device {device.serial}: [3/3] เปิดแอพใหม่ (รอบที่ {clearstage4_count + 1})...")
                         open_app(device)
                         time.sleep(10)
+
+                        # STOP ครั้งแรก = จบด่านแรกเท่านั้น ยังไม่ทำ 7day
+                        # ให้กลับไปลูปตรวจจับปกติเล่น stage2 ต่อจนจบก่อน
+                        # (ลูปปกติจัดการ steage2 -> start -> clearstage1,2,3,5 เองอยู่แล้ว)
+                        # พอ stage2 จบจะเจอ STOP ครั้งที่ 2 แล้วค่อยเปิดแอพรอบ 3 ไปทำ event/BACK/7day
+                        if clearstage4_count < STOP_ROUNDS_BEFORE_7DAY:
+                            print(f"Device {device.serial}: ยังไม่ทำ 7day - กลับไปเล่น stage2 ให้จบก่อน")
+                            mark_activity(device)  # เจอ STOP = มีความคืบหน้า กัน watchdog เข้าใจผิดว่าค้าง
+                            tried_mainstage = False
+                            mainstage_attempts = 0
+                            event_start_time = None
+                            event_found_continuously = False
+                            check_fixback = False
+                            continue
+
+                        # ถึงตรงนี้ = stage2 จบแล้ว และเพิ่งเปิดแอพรอบที่ 3 -> เริ่มงาน 7day ตามปกติ
+                        print(f"Device {device.serial}: stage2 จบแล้ว -> เริ่มงาน 7day")
 
                         # เริ่มค้นหา event.png
                         print(f"Device {device.serial}: เริ่มค้นหา event.png...")
